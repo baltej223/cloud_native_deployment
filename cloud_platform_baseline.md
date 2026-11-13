@@ -1,81 +1,111 @@
-# Cloud-Native Deployment & Processing Platform
+# Cloud-Native Deployment Platform
 
 ## 1. The Problem: What are we trying to solve?
 
-In traditional application development and hosting, teams often face two major bottlenecks that hinder scalability, reliability, and developer velocity:
+Putting an application on the internet is still harder than writing it. A developer who has a working app in a GitHub repository, or a Docker image, faces a long list of chores before anyone else can use it:
 
-1. **Manual and Inefficient Deployment Workflows:** Building Docker images, configuring infrastructure, and deploying applications manually is tedious, error-prone, and time-consuming. This friction slows down the release of new features and makes rolling back changes difficult.
+1. **Manual, error-prone deployment:** Building the image, pushing it to a registry, writing container definitions, opening ports, wiring a load balancer and checking health are all done by hand. Each step is a chance to make a mistake, and nobody wants to repeat it for every change.
 
-2. **Resource Contention and Synchronous Processing:** When a web application handles computationally expensive or long-running tasks (like machine learning jobs, heavy data processing, or file conversions) synchronously, it blocks the application servers. This leads to slow response times for users, potential server crashes under high load, and an inability to handle concurrent heavy workloads efficiently.
+2. **Infrastructure knowledge as a barrier:** To deploy on a cloud provider, a developer has to understand networking, IAM, container orchestration and load balancing. Most developers only want a URL that serves their app.
 
-3. **Monolithic Scaling Issues:** In a tightly coupled system, you cannot scale the background processing independently of the web-facing API. If the processing load spikes, you are forced to scale the entire application, which is highly inefficient and costly. Additionally, handling worker failures manually or losing data when a process crashes creates a poor user experience.
+3. **No standard way to observe or update a running app:** Without a platform, every app ends up with its own way to view logs, redeploy, roll back or shut down. Mistakes are slow to notice and expensive to fix, and forgotten apps keep costing money.
 
-The broader challenge is moving from simply "hosting an app on a server" to engineering a resilient, highly available, and operationally mature cloud environment.
+Hosted platforms such as Vercel, Render and Heroku solve this by hiding the infrastructure behind "give us your code, get a URL". This project builds a small platform of that kind on AWS, to show how such a system works inside.
 
 ## 2. Our Solution: What is our approach?
 
-We are building a comprehensive, mini cloud platform on AWS that merges automated application deployment with a highly scalable, distributed background processing system. Our solution decouples the frontend user experience from heavy backend processing using cloud-native design patterns.
+We are building a mini Platform-as-a-Service (PaaS) on AWS. A user gives the platform **a public GitHub repository (with a Dockerfile) or a Docker image**, and the platform builds it, runs it as a container, routes traffic to it and returns a **public URL**. The platform itself is also deployed automatically from its own repository.
 
 **Key Pillars of the Solution:**
 
-* **End-to-End Automation (CI/CD):** We are eliminating manual deployments. Every code push triggers an automated pipeline that tests, builds, and deploys the application securely into the cloud.
+* **One-step deployment for users:** Submit a repository or image and a port. The platform handles cloning, building, pushing, running, routing and health checking, and reports progress until the app is live.
 
-* **Asynchronous, Decoupled Architecture:** We are adopting a producer-consumer model. User requests are quickly acknowledged by the API, while the heavy lifting is offloaded to a message queue and processed in the background.
+* **The platform deploys itself (CI/CD):** Every push to the platform's own repository runs checks, builds images and rolls out the new version, with no manual steps.
 
-* **Independent Horizontal Scaling:** The system is designed so that the API layer and the worker/processing layer scale independently based on their specific metrics (e.g., HTTP traffic vs. queue depth).
+* **Isolation and least privilege:** Every user app runs in its own container with fixed CPU and memory limits and no AWS permissions. The platform's own components only get the permissions they need.
 
-* **Built-in Fault Tolerance:** If a processing job fails, the system automatically catches it and returns the job to the queue for a retry, ensuring no tasks are dropped due to transient worker failures.
+* **Self-healing and observable:** The platform records the desired state of every app in its database and keeps the real infrastructure in line with it. Each app has its own build logs, runtime logs and health status, and the platform reports its overall health through CloudWatch.
+
+* **Cost-aware by design:** Apps have resource limits, there is a limit on the number of apps, and idle apps stop automatically, so a demo does not turn into a bill.
 
 ## 3. Implementation Plan: How will it be built?
 
-As detailed in the architecture diagram from the *Cloud_Project.pdf*, the implementation is divided into distinct, interconnected layers utilizing AWS managed services, Docker, Next.js, and Node.js.
+The implementation uses AWS managed services, Docker, Next.js and Node.js.
 
 ### A. Tech Stack
 
-* **Frontend:** Next.js (Web Application)
+* **Frontend:** Next.js (platform dashboard)
 
-* **Backend API:** Node.js
+* **Backend API:** Node.js (Express), including the deployment controller
 
 * **Containerization:** Docker
 
-* **CI/CD:** GitHub Actions
+* **CI/CD (platform itself):** GitHub Actions
 
-* **AWS Services:** Amazon ECS, Amazon ECR, Amazon SQS, Amazon S3, Amazon RDS (PostgreSQL), Application Load Balancer (ALB), Amazon CloudWatch, AWS IAM.
+* **Builds (user apps):** AWS CodeBuild
+
+* **AWS Services:** Amazon ECS on Fargate, Amazon ECR, AWS CodeBuild, Application Load Balancer (ALB), Amazon CloudWatch, AWS IAM, AWS Systems Manager Parameter Store, AWS CloudFormation
+
+* **Database:** PostgreSQL (hosted on Supabase; Amazon RDS also works with only a configuration change)
 
 ### B. Architectural Workflow
 
-**Part 1: CI/CD & Deployment Pipeline**
+**Part 1: Deploying a user's app**
 
-1. **Source Control & CI:** A developer pushes code to a GitHub repository.
+1. **Submit:** The user opens the platform dashboard and creates a project, giving either a public GitHub repository URL (with branch and Dockerfile path) or a Docker image reference, plus the port the app listens on and optional environment variables.
 
-2. **Build & Package:** GitHub Actions automatically triggers, runs tests, and builds a Docker image of the application.
+2. **Record the deployment:** The API validates the request, saves the project and a new deployment in PostgreSQL with status `pending`, and responds right away. PostgreSQL holds the desired state; it is the source of truth.
 
-3. **Registry:** The pipeline pushes the newly built Docker image to **Amazon ECR** (Elastic Container Registry).
+3. **Build (repository source only):** The deployment controller starts an **AWS CodeBuild** build. CodeBuild clones the repository, runs `docker build` and pushes the image to **Amazon ECR**. Status: `building`. Image sources skip this step.
 
-4. **Deployment:** **Amazon ECS** (Elastic Container Service) pulls the latest image and orchestrates the containers.
+4. **Run:** The controller registers an **ECS task definition** for the image, with fixed CPU and memory and no task role. It then creates or updates the project's **ECS service** on Fargate. Status: `deploying`.
 
-5. **Traffic Routing:** An **Application Load Balancer (ALB)** routes incoming public internet traffic to the active ECS containers securely.
+5. **Route:** The controller attaches the service to the **Application Load Balancer**. Each project gets its own ALB listener port, and its URL is `http://<load-balancer>:<port>`. If a domain is configured, each project instead gets `<project>.<domain>` through host-based routing.
 
-**Part 2: Distributed Background Processing (Producer-Consumer)**
+6. **Go live:** When the ALB health check passes, the deployment becomes `live` and the dashboard shows the URL. If the build fails, the container keeps crashing or the health check never passes, the deployment becomes `failed` with a clear reason, and the previous live version, if there is one, keeps serving.
 
-1. **User Interaction (Producer):** Users interact with the Next.js Web Application to submit files or long-running tasks.
+**Part 2: The deployment controller (no queue)**
 
-2. **API Layer:** The Node.js API servers receive the request. Instead of processing it, the API creates a job payload and sends a message to **Amazon SQS** (Simple Queue Service).
+Builds and rollouts take minutes, so the API does not do them inside the HTTP request. Instead a **reconciliation loop** runs inside the API service:
 
-3. **Worker Layer (Consumer):** A separate fleet of Worker Containers running on ECS auto-scaling groups continuously polls the SQS queue.
+1. It periodically reads deployments that are not finished from PostgreSQL.
+2. For each one, it checks the real state in AWS (build status, service status, target health) and takes the next step.
+3. Every step is idempotent: resources are named after the project, and the controller checks before it creates. A crash or restart simply resumes from the state in the database.
+4. A PostgreSQL advisory lock ensures that only one API task runs the controller at a time, even when the API scales out.
 
-4. **Execution & Storage:** When a worker fetches a job, it processes it independently. Upon success:
+This replaces a message queue: the database records what should exist, and the controller makes AWS match it.
 
-   * The raw output/processed files are stored in **Amazon S3** (Object Storage).
+**Part 3: Managing a running app**
 
-   * Job metadata, status updates, and user data are updated in **Amazon RDS** running PostgreSQL.
+* **Redeploy:** Build or pull again and roll out the new version (ECS rolling update; the old version serves until the new one is healthy).
+* **Roll back:** Redeploy an earlier deployment's image, with no rebuild.
+* **Stop / start:** Scale the service to 0 or back to 1, keeping the URL.
+* **Delete:** Remove the service, listener and target group; release the port.
+* **Logs:** Build logs (from CodeBuild) and runtime logs (from the container) are shown in the dashboard, read from CloudWatch Logs.
+* **Auto-stop:** Apps stop after a configurable idle period (default 2 hours) to limit cost.
 
-### C. Scalability, Fault Tolerance, and Observability
+**Part 4: CI/CD for the platform itself**
 
-* **Auto-Scaling:** The ECS Worker Layer is configured to scale horizontally. As the SQS queue depth (number of pending jobs) increases, AWS automatically provisions more worker containers to handle the load.
+1. **Source Control & CI:** A developer pushes code to the platform's GitHub repository.
+2. **Build & Package:** GitHub Actions runs type checks, tests and formatting checks, then builds the web and API images.
+3. **Registry:** The pipeline pushes the images, tagged with the commit, to **Amazon ECR**.
+4. **Deployment:** The pipeline runs database migrations as a one-off ECS task, then updates the CloudFormation stack, so **Amazon ECS** rolls out the new images with a circuit breaker that rolls back on failure.
+5. **Traffic Routing:** The **ALB** routes the platform's own traffic (port 80) to the web and API services.
 
-* **Retries (Fault Tolerance):** If a worker container crashes or fails to process a job, the message visibility timeout expires in SQS, making the message available again for another worker to pick up and retry.
+GitHub Actions authenticates to AWS through OIDC with a short-lived role; there are no stored AWS keys.
 
-* **Security:** **AWS IAM** will enforce least-privilege access control, ensuring components (like workers) only have permission to access necessary resources (like specific S3 buckets or SQS queues).
+### C. Security, Reliability and Observability
 
-* **Monitoring:** **Amazon CloudWatch** acts as the central observability hub. It tracks CPU/memory usage, active worker count, SQS queue length, incoming requests, and job completion/failure rates to provide a real-time health overview of the system.
+* **Isolation of user apps:** Each app runs in its own Fargate task with 0.25 vCPU and 512 MB by default, no IAM task role, and a security group that only accepts traffic from the ALB. User apps cannot reach the platform's database credentials or AWS APIs.
+
+* **Least privilege (IAM):** The API's task role can only manage resources whose names start with the platform's prefix, can pass only the app execution role, and can start only the platform's CodeBuild project. The CodeBuild role can push only to the apps ECR repository. GitHub Actions has a separate deploy role.
+
+* **Access control:** The platform dashboard and API are only reachable from an allowed IP range, and creating deployments requires a deploy token. Deployed apps are public, because the point is to share the URL.
+
+* **Limits:** There is a maximum number of projects (default 10), fixed task sizes, a build timeout (15 minutes), and the idle auto-stop.
+
+* **Reliability:** ECS restarts crashed containers, rolling updates keep the old version until the new one is healthy, and the controller resumes cleanly after restarts.
+
+* **Monitoring:** **Amazon CloudWatch** collects platform and app logs. A dashboard shows running apps, deployments per hour, build duration, failed deployments, per-app request and error counts from the ALB, and platform CPU. Alarms fire on repeated deployment failures, unhealthy platform targets, platform 5xx errors and an unexpectedly high number of running app tasks (a cost guard).
+
+* **Secrets:** The database password is stored in SSM Parameter Store and injected into the API at runtime; it is never in the repository, images or logs. App environment variables are stored in the platform database and are not meant for secrets in the first version.
