@@ -36,11 +36,13 @@ FROM backend AS migrate
 CMD ["node", "packages/platform/dist/migrate-cli.js"]
 
 FROM backend AS api
-# git clones repositories for builds; tar packs the build context.
+# git clones repositories; the Docker CLI with buildx builds them with BuildKit.
 USER root
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends git ca-certificates tar \
+  && apt-get install -y --no-install-recommends git ca-certificates \
   && rm -rf /var/lib/apt/lists/*
+COPY --from=docker.io/library/docker:28.4.0-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker.io/library/docker:28.4.0-cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
 USER node
 COPY --from=build-backend /app/apps/api/package.json ./apps/api/
 COPY --from=build-backend /app/apps/api/dist ./apps/api/dist

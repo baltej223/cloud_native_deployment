@@ -314,3 +314,54 @@ test("a failed redeploy restores the previous live version", async () => {
   assert.equal(running.spec.deploymentId, first.id);
   assert.equal(running.spec.image, liveImage);
 });
+
+// ---------------------------------------------------------------------------
+// Compose apps
+// ---------------------------------------------------------------------------
+
+const service = (name: string, image: string, pull: boolean) => ({
+  name,
+  image,
+  pull,
+  command: null,
+  entrypoint: null,
+  env: {},
+  volumes: [],
+  tmpVolumes: [],
+  workingDir: null,
+  user: null,
+  restart: "unless-stopped" as const,
+  dependsOn: [],
+});
+
+test("a compose app runs all its services and keeps the plan with the deployment", async () => {
+  const { project, deployment } = await createProject(REPO, "shop");
+  const web = service("web", `localhost/cp-app-${project.id}-web:x`, false);
+  const db = service("db", "docker.io/library/postgres:17-alpine", true);
+  builder.compose = { file: "compose.yaml", publicService: "web", services: [db, web] };
+  builder.exposedPort = 3000;
+
+  await ticks(3);
+  assert.equal(builder.requests[0]!.env.A, "1", "project variables reach the compose file");
+  const spec = runtime.deployed[0]!;
+  assert.deepEqual(spec.compose, builder.compose);
+  assert.deepEqual(spec.env, {}, "no PORT or project env injected into compose services");
+  assert.equal((await latestOf(project.id)).compose?.publicService, "web");
+
+  // A few restarts while the database starts are tolerated.
+  runtime.apps.get(project.id)!.state = {
+    state: "running",
+    deploymentId: deployment.id,
+    exitCode: null,
+    restartCount: 2,
+    startedAt: new Date(clock),
+  };
+  await ticks(1);
+  assert.equal(await statusOf(project.id), "live");
+
+  // Deleting removes built images and volumes, but not pulled images.
+  await repository.markDeleted(project.id);
+  await ticks(1);
+  assert.deepEqual(runtime.removedImages, [web.image]);
+  assert.deepEqual(runtime.removedData, [project.id]);
+});

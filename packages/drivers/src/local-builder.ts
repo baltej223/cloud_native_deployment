@@ -1,13 +1,24 @@
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
-import { join, posix, relative, sep } from "node:path";
-import { Transform } from "node:stream";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import {
-  chooseDockerfile,
-  dockerignoreExcludes,
-  findDockerfiles,
-  parseExposedPort,
-} from "./dockerfile.js";
+  cp,
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { join, posix, relative, sep } from "node:path";
+import {
+  choosePublicService,
+  COMPOSE_FILE_NAMES,
+  DEFAULT_MAX_COMPOSE_SERVICES,
+  parseCompose,
+} from "./compose.js";
+import { chooseDockerfile, findDockerfiles, parseExposedPort } from "./dockerfile.js";
 import { DockerEngine } from "./docker-engine.js";
 import {
   appName,
@@ -15,6 +26,7 @@ import {
   type BuildRequest,
   type BuildResult,
   type Builder,
+  type ServiceSpec,
 } from "./types.js";
 
 export interface LocalBuilderOptions {
@@ -25,6 +37,13 @@ export interface LocalBuilderOptions {
   cloneTimeoutMs?: number;
   /** Largest build context the platform sends to the engine. */
   maxContextBytes?: number;
+  /** Most services a compose file may start. */
+  maxComposeServices?: number;
+}
+
+interface BuildOptions {
+  args?: Record<string, string>;
+  target?: string | null;
 }
 
 const DEFAULT_MAX_CONTEXT_BYTES = 500 * 1024 * 1024;
@@ -43,6 +62,7 @@ function run(
     signal: AbortSignal;
     timeoutMs: number;
     onOutput?: (text: string) => void;
+    env?: Record<string, string>;
   },
 ): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -56,6 +76,7 @@ function run(
         // Never prompt for credentials: private repositories must fail, not hang.
         GIT_TERMINAL_PROMPT: "0",
         GIT_ASKPASS: "/bin/false",
+        ...options.env,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -141,7 +162,13 @@ export class LocalBuilder implements Builder {
       ).trim();
       onLog(`==> Commit ${commitSha}\n`);
 
-      // 2. Find the Dockerfile.
+      // 2. A compose file at the root wins, unless the user chose a Dockerfile.
+      if (!request.dockerfilePath) {
+        const composeFile = await this.findComposeFile(source);
+        if (composeFile) return await this.buildCompose(request, source, composeFile, commitSha);
+      }
+
+      // 3. Find the Dockerfile.
       const dockerfilePath = request.dockerfilePath
         ? await this.checkDockerfile(source, request.dockerfilePath)
         : chooseDockerfile(await findDockerfiles(source), repoUrl);
@@ -152,7 +179,7 @@ export class LocalBuilder implements Builder {
         `==> Using ${dockerfilePath}${request.dockerfilePath ? "" : " (found automatically)"}, build context ${contextPath === "." ? "the repository root" : contextPath}\n`,
       );
 
-      // 3. Read the port.
+      // 4. Read the port.
       const exposedPort = parseExposedPort(await readFile(join(source, dockerfilePath), "utf8"));
       onLog(
         exposedPort
@@ -160,7 +187,7 @@ export class LocalBuilder implements Builder {
           : "==> Dockerfile has no EXPOSE instruction\n",
       );
 
-      // 4. Build.
+      // 5. Build.
       const image = `localhost/${appName(request.projectId)}:${request.deploymentId.slice(0, 12)}`;
       onLog(`==> Building image ${image}\n`);
       await this.buildContext(contextDir, dockerfileName, image, signal, onLog);
@@ -169,6 +196,159 @@ export class LocalBuilder implements Builder {
       return { image, commitSha, dockerfilePath, contextPath, exposedPort };
     } finally {
       await rm(workDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /** The first compose file at the repository root that is a regular file. */
+  private async findComposeFile(source: string): Promise<string | null> {
+    for (const name of COMPOSE_FILE_NAMES) {
+      try {
+        if ((await lstat(join(source, name))).isFile()) return name;
+      } catch {
+        // Not there.
+      }
+    }
+    return null;
+  }
+
+  /** Read a repository file without following links out of the repository. */
+  private readRepoFile(source: string, path: string): string | null {
+    try {
+      const root = realpathSync(source);
+      const real = realpathSync(join(source, ...path.split("/")));
+      const inside = relative(root, real);
+      if (inside.startsWith("..") || inside.split(sep).includes("..")) return null;
+      if (!statSync(real).isFile()) return null;
+      return readFileSync(real, "utf8");
+    } catch {
+      return null;
+    }
+  }
+
+  /** Build every service of a compose file that has a build section. */
+  private async buildCompose(
+    request: BuildRequest,
+    source: string,
+    file: string,
+    commitSha: string,
+  ): Promise<BuildResult> {
+    const { signal, onLog } = request;
+    onLog(`==> Using ${file} (found at the repository root)\n`);
+    const parsed = parseCompose(await readFile(join(source, file), "utf8"), {
+      file,
+      env: request.env,
+      readFile: (path) => this.readRepoFile(source, path),
+      maxServices: this.options.maxComposeServices ?? DEFAULT_MAX_COMPOSE_SERVICES,
+    });
+    for (const warning of parsed.warnings) onLog(`==> Note: ${warning}\n`);
+    const publicService = choosePublicService(parsed, file, request.composeService);
+    onLog(
+      `==> Services: ${parsed.services.map((service) => service.name).join(", ")}; ${publicService.name} gets the URL\n`,
+    );
+
+    let exposedPort = publicService.port;
+    const services: ServiceSpec[] = [];
+    for (const service of parsed.services) {
+      const { build, publishes: _publishes, port: _port, image: pulled, copies, ...rest } = service;
+      const image = `localhost/${appName(request.projectId)}-${service.name.toLowerCase()}:${request.deploymentId.slice(0, 12)}`;
+      if (!build) {
+        onLog(`==> Service ${service.name} uses image ${pulled}\n`);
+        if (copies.length === 0) {
+          services.push({ ...rest, image: pulled!, pull: true });
+          continue;
+        }
+        await this.addCopies(source, pulled!, image, copies, request);
+        services.push({ ...rest, image, pull: false });
+        continue;
+      }
+      const dockerfilePath = await this.checkDockerfile(
+        source,
+        posix.join(build.context, build.dockerfile),
+      );
+      const contextDir = await this.checkContext(source, build.context);
+      onLog(
+        `==> Building service ${service.name} from ${dockerfilePath} (context ${build.context === "." ? "the repository root" : build.context})\n`,
+      );
+      await this.buildContext(contextDir, build.dockerfile, image, signal, onLog, build);
+      onLog(`==> Built ${image}\n`);
+      if (service === publicService && exposedPort === null) {
+        exposedPort = parseExposedPort(await readFile(join(source, dockerfilePath), "utf8"));
+      }
+      if (copies.length) await this.addCopies(source, image, image, copies, request);
+      services.push({ ...rest, image, pull: false });
+    }
+    if (exposedPort) onLog(`==> Service ${publicService.name} listens on port ${exposedPort}\n`);
+
+    const publicSpec = services.find((service) => service.name === publicService.name)!;
+    return {
+      image: publicSpec.image,
+      commitSha,
+      dockerfilePath: file,
+      contextPath: ".",
+      exposedPort,
+      compose: { file, publicService: publicService.name, services },
+    };
+  }
+
+  /**
+   * Bake folders a service mounts from the repository into its image: build
+   * `FROM base` + `COPY` on top, tagged `tag`.
+   */
+  private async addCopies(
+    source: string,
+    base: string,
+    tag: string,
+    copies: Array<{ source: string; target: string }>,
+    request: BuildRequest,
+  ): Promise<void> {
+    const { signal, onLog } = request;
+    const contextDir = await mkdtemp(join(this.options.workDir, "copies-"));
+    try {
+      const lines = [`FROM ${base}`];
+      for (const [index, copy] of copies.entries()) {
+        const from = await this.checkRepoPath(source, copy.source);
+        await cp(from, join(contextDir, `c${index}`), {
+          recursive: true,
+          // Links are copied as links, never followed out of the repository.
+          verbatimSymlinks: true,
+          filter: (path) => !path.split(sep).includes(".git"),
+        });
+        lines.push(`COPY c${index} ${JSON.stringify(copy.target)}`);
+        onLog(`==> Copying ${copy.source} to ${copy.target} (mounted in the compose file)\n`);
+      }
+      await writeFile(join(contextDir, "Dockerfile"), `${lines.join("\n")}\n`);
+      await this.buildContext(contextDir, "Dockerfile", tag, signal, onLog);
+    } finally {
+      await rm(contextDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
+
+  /** A file or folder inside the repository, links resolved. */
+  private async checkRepoPath(source: string, path: string): Promise<string> {
+    try {
+      const [real, root] = await Promise.all([
+        realpath(join(source, ...path.split("/"))),
+        realpath(source),
+      ]);
+      const inside = relative(root, real);
+      if (inside.startsWith("..") || inside.split(sep).includes("..")) throw new Error("outside");
+      return real;
+    } catch {
+      throw new DeployError(`The folder ${path} mounted in the compose file does not exist.`);
+    }
+  }
+
+  /** A build context must be a folder inside the repository. */
+  private async checkContext(source: string, path: string): Promise<string> {
+    const absolute = join(source, ...path.split("/"));
+    try {
+      const [real, root] = await Promise.all([realpath(absolute), realpath(source)]);
+      const inside = relative(root, real);
+      if (inside.startsWith("..") || inside.split(sep).includes("..")) throw new Error("outside");
+      if (!(await stat(real)).isDirectory()) throw new Error("not a folder");
+      return real;
+    } catch {
+      throw new DeployError(`The build context ${path} does not exist in the repository.`);
     }
   }
 
@@ -187,64 +367,72 @@ export class LocalBuilder implements Builder {
     return normalized;
   }
 
+  /**
+   * Build with BuildKit (`docker buildx build`), like `docker build` does
+   * today: .dockerignore, `FROM --platform=$BUILDPLATFORM`, `RUN --mount` and
+   * other modern Dockerfile features work. The engine's own /build endpoint
+   * uses the legacy builder, which supports none of them.
+   */
   private async buildContext(
     contextDir: string,
     dockerfile: string,
     tag: string,
     signal: AbortSignal,
     onLog: (text: string) => void,
+    options: BuildOptions = {},
   ): Promise<void> {
-    let excludes: string[] = [];
-    try {
-      excludes = dockerignoreExcludes(await readFile(join(contextDir, ".dockerignore"), "utf8"));
-    } catch {
-      // No .dockerignore.
+    // Refuse huge contexts before sending them (.git excluded; .dockerignore
+    // is applied by BuildKit, so this count is an upper bound).
+    const limit = this.options.maxContextBytes ?? DEFAULT_MAX_CONTEXT_BYTES;
+    const size = Number(
+      (await run("du", ["-sb", "--exclude=.git", contextDir], { signal, timeoutMs: 60_000 })).split(
+        /\s/,
+      )[0],
+    );
+    if (size > limit) {
+      throw new DeployError(
+        `The build context is larger than ${Math.round(limit / 1024 / 1024)} MB. Add a .dockerignore file.`,
+      );
     }
 
-    const tar = spawn(
-      "tar",
-      [
-        "-c",
-        "--exclude=.git",
-        ...excludes.map((pattern) => `--exclude=${pattern}`),
-        "-C",
-        contextDir,
-        ".",
-      ],
-      { signal, stdio: ["ignore", "pipe", "pipe"] },
-    );
-    let tarError = "";
-    tar.stderr.setEncoding("utf8").on("data", (chunk: string) => (tarError += chunk));
-    tar.on("error", () => {});
-
-    // Stop sending once the context is too large.
-    const limit = this.options.maxContextBytes ?? DEFAULT_MAX_CONTEXT_BYTES;
-    let bytes = 0;
-    const counter = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        bytes += chunk.length;
-        if (bytes > limit) {
-          callback(
-            new DeployError(
-              `The build context is larger than ${Math.round(limit / 1024 / 1024)} MB. Add a .dockerignore file.`,
-            ),
-          );
-        } else {
-          callback(null, chunk);
-        }
-      },
-    });
-    tar.stdout.pipe(counter);
-
+    const args = [
+      "buildx",
+      "build",
+      "--load",
+      "--progress=plain",
+      "--tag",
+      tag,
+      "--file",
+      join(contextDir, ...dockerfile.split("/")),
+      ...Object.entries(options.args ?? {}).flatMap(([key, value]) => [
+        "--build-arg",
+        `${key}=${value}`,
+      ]),
+      ...(options.target ? ["--target", options.target] : []),
+      contextDir,
+    ];
+    let output = "";
     try {
-      await this.engine.build(counter, { tag, dockerfile, signal }, onLog);
+      await run("docker", args, {
+        signal,
+        timeoutMs: 24 * 60 * 60_000, // the build timeout comes from `signal`
+        env: { DOCKER_HOST: `unix://${this.options.socketPath}`, DOCKER_CLI_HINTS: "false" },
+        onOutput: (text) => {
+          output = (output + text).slice(-8_192);
+          onLog(text);
+        },
+      });
     } catch (error) {
       if (signal.aborted) throw error;
-      if (error instanceof DeployError) throw error;
-      if (tarError)
-        throw new DeployError(`Could not package the build context: ${shorten(tarError)}`);
-      const message = error instanceof Error ? error.message : String(error);
-      throw new DeployError(`The build failed: ${shorten(message)} See the build log for details.`);
+      // BuildKit ends a failed build with "ERROR: failed to build: …".
+      const reason =
+        output
+          .split("\n")
+          .reverse()
+          .find((line) => /^ERROR:/.test(line.trim()))
+          ?.replace(/^\s*ERROR:\s*/, "") ??
+        (error instanceof Error ? error.message : String(error));
+      throw new DeployError(`The build failed: ${shorten(reason)} See the build log for details.`);
     }
   }
 }

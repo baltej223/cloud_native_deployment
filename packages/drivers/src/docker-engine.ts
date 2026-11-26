@@ -1,5 +1,4 @@
 import { request } from "node:http";
-import type { Readable } from "node:stream";
 
 /**
  * Minimal client for the Docker Engine API over a Unix socket. Podman serves
@@ -78,84 +77,6 @@ export class DockerEngine {
     }
   }
 
-  /**
-   * Build an image from a tar stream of the build context. Output lines
-   * (`stream`) go to `onOutput`; a build error is thrown as an EngineError.
-   */
-  async build(
-    context: Readable,
-    options: { tag: string; dockerfile: string; signal: AbortSignal },
-    onOutput: (text: string) => void,
-  ): Promise<void> {
-    const query = new URLSearchParams({
-      t: options.tag,
-      dockerfile: options.dockerfile,
-      rm: "1",
-      forcerm: "1",
-    });
-    await new Promise<void>((resolve, reject) => {
-      let failure: string | undefined;
-      let pending = "";
-      let status = 0;
-      let body = "";
-
-      const handleLine = (line: string) => {
-        if (!line.trim()) return;
-        let message: {
-          stream?: string;
-          status?: string;
-          error?: string;
-          errorDetail?: { message?: string };
-          message?: string;
-        };
-        try {
-          message = JSON.parse(line);
-        } catch {
-          onOutput(`${line}\n`);
-          return;
-        }
-        if (message.stream) onOutput(message.stream);
-        else if (message.status) onOutput(`${message.status}\n`);
-        const error = message.errorDetail?.message ?? message.error;
-        if (error) failure = error;
-      };
-
-      const req = request(
-        {
-          socketPath: this.socketPath,
-          method: "POST",
-          path: `${this.prefix}/build?${query}`,
-          headers: { Host: "docker", "Content-Type": "application/x-tar" },
-          signal: options.signal,
-        },
-        (res) => {
-          status = res.statusCode ?? 0;
-          res.setEncoding("utf8");
-          res.on("data", (chunk: string) => {
-            if (status !== 200) {
-              body += chunk;
-              return;
-            }
-            pending += chunk;
-            const lines = pending.split(/\r?\n/);
-            pending = lines.pop() ?? "";
-            lines.forEach(handleLine);
-          });
-          res.on("end", () => {
-            if (status !== 200) return reject(new EngineError(status, body));
-            handleLine(pending);
-            if (failure) reject(new EngineError(500, JSON.stringify({ message: failure })));
-            else resolve();
-          });
-          res.on("error", reject);
-        },
-      );
-      req.on("error", reject);
-      context.on("error", (error) => req.destroy(error));
-      context.pipe(req);
-    });
-  }
-
   /** Remove an image. Succeeds if it does not exist or is still in use. */
   async removeImage(name: string): Promise<void> {
     const response = await this.call("DELETE", `/images/${encodeURIComponent(name)}`);
@@ -164,15 +85,70 @@ export class DockerEngine {
     }
   }
 
+  /** Names of containers (running or not) that carry the given label. */
+  async listContainers(label: string): Promise<string[]> {
+    const filters = encodeURIComponent(JSON.stringify({ label: [label] }));
+    const response = await this.call("GET", `/containers/json?all=true&filters=${filters}`);
+    if (response.status !== 200) throw new EngineError(response.status, response.body);
+    return (JSON.parse(response.body) as Array<{ Names: string[] }>).map((container) =>
+      container.Names[0]!.replace(/^\//, ""),
+    );
+  }
+
+  /** Create a named volume; an existing one is kept. */
+  async createVolume(name: string, labels: Record<string, string>): Promise<void> {
+    const response = await this.call("POST", "/volumes/create", { Name: name, Labels: labels });
+    if (response.status !== 201 && response.status !== 200) {
+      throw new EngineError(response.status, response.body);
+    }
+  }
+
+  /** Names of volumes that carry the given label. */
+  async listVolumes(label: string): Promise<string[]> {
+    const filters = encodeURIComponent(JSON.stringify({ label: [label] }));
+    const response = await this.call("GET", `/volumes?filters=${filters}`);
+    if (response.status !== 200) throw new EngineError(response.status, response.body);
+    const body = JSON.parse(response.body) as { Volumes: Array<{ Name: string }> | null };
+    return (body.Volumes ?? []).map((volume) => volume.Name);
+  }
+
+  /** Remove a volume. Succeeds if it does not exist. */
+  async removeVolume(name: string): Promise<void> {
+    const response = await this.call("DELETE", `/volumes/${encodeURIComponent(name)}?force=true`);
+    if (response.status !== 204 && response.status !== 404) {
+      throw new EngineError(response.status, response.body);
+    }
+  }
+
+  /** Attach a (not yet started) container to another network under extra host names. */
+  async connectNetwork(network: string, container: string, aliases: string[]): Promise<void> {
+    const response = await this.call("POST", `/networks/${encodeURIComponent(network)}/connect`, {
+      Container: container,
+      EndpointConfig: { Aliases: aliases },
+    });
+    if (response.status !== 200) throw new EngineError(response.status, response.body);
+  }
+
+  /** Remove a network. Succeeds if it does not exist. */
+  async removeNetwork(name: string): Promise<void> {
+    const response = await this.call("DELETE", `/networks/${encodeURIComponent(name)}`);
+    if (response.status !== 204 && response.status !== 200 && response.status !== 404) {
+      throw new EngineError(response.status, response.body);
+    }
+  }
+
   /** Create a bridge network unless it already exists. */
-  async ensureNetwork(name: string): Promise<void> {
+  async ensureNetwork(
+    name: string,
+    labels: Record<string, string> = { "cloud-platform.network": "apps" },
+  ): Promise<void> {
     const existing = await this.call("GET", `/networks/${encodeURIComponent(name)}`);
     if (existing.status === 200) return;
     if (existing.status !== 404) throw new EngineError(existing.status, existing.body);
     const created = await this.call("POST", "/networks/create", {
       Name: name,
       Driver: "bridge",
-      Labels: { "cloud-platform.network": "apps" },
+      Labels: labels,
     });
     // 409: created concurrently by someone else.
     if (created.status !== 201 && created.status !== 409) {

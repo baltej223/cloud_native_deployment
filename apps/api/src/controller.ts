@@ -28,6 +28,9 @@ export interface ControllerOptions {
   now?: () => number;
 }
 
+/** Restarts a compose app's public service may have while it waits for its dependencies. */
+const COMPOSE_RESTARTS_ALLOWED = 5;
+
 interface RunningBuild {
   projectId: string;
   abort: AbortController;
@@ -200,6 +203,8 @@ export class DeploymentController {
           repoUrl: source.repoUrl,
           branch: source.branch,
           dockerfilePath: source.dockerfilePath,
+          composeService: source.composeService,
+          env: project.env,
           signal,
           onLog: (text) => {
             output = (output + text).slice(-BUILD_LOG_MAX_CHARS);
@@ -210,10 +215,12 @@ export class DeploymentController {
         const port = project.containerPort ?? result.exposedPort;
         if (!port) {
           return await fail(
-            `${result.dockerfilePath} has no EXPOSE instruction, so the port the app listens on is unknown. Set the container port and deploy again.`,
+            result.compose
+              ? `Service ${result.compose.publicService} in ${result.compose.file} has no ports or expose entry and its Dockerfile no EXPOSE, so the port it listens on is unknown. Set the container port and deploy again.`
+              : `${result.dockerfilePath} has no EXPOSE instruction, so the port the app listens on is unknown. Set the container port and deploy again.`,
           );
         }
-        output += `==> The app will listen on port ${port}${project.containerPort ? " (set by you)" : " (from EXPOSE)"}\n`;
+        output += `==> The app will listen on port ${port}${project.containerPort ? " (set by you)" : result.compose ? " (from the compose file)" : " (from EXPOSE)"}\n`;
         dirty = true;
         if (
           await this.repository.transition(deployment.id, "building", "deploying", {
@@ -222,6 +229,7 @@ export class DeploymentController {
             dockerfilePath: result.dockerfilePath,
             contextPath: result.contextPath,
             containerPort: port,
+            ...(result.compose ? { compose: result.compose } : {}),
           })
         ) {
           log.info(
@@ -264,9 +272,12 @@ export class DeploymentController {
       image: deployment.imageRef!,
       containerPort,
       // Apps that read $PORT listen where the platform expects; a user's PORT wins.
-      env: { [PORT_ENV_VAR]: String(containerPort), ...project.env },
+      // Compose apps get their environment from the compose file instead (the
+      // project's variables fill in its ${VAR} references).
+      env: deployment.compose ? {} : { [PORT_ENV_VAR]: String(containerPort), ...project.env },
       publicPort: project.assignedPort,
       pull: project.source.type === "image",
+      ...(deployment.compose ? { compose: deployment.compose } : {}),
     };
   }
 
@@ -312,7 +323,14 @@ export class DeploymentController {
       return;
     }
 
-    if (state.state === "exited" || state.state === "restarting" || state.restartCount > 0) {
+    // A compose app's service may restart a few times while the services it
+    // depends on (a database, say) start up.
+    const crashLimit = deployment.compose ? COMPOSE_RESTARTS_ALLOWED : 0;
+    if (
+      state.state === "exited" ||
+      (state.state === "restarting" && !deployment.compose) ||
+      state.restartCount > crashLimit
+    ) {
       return fail(
         `The app exited${state.exitCode !== null ? ` with code ${state.exitCode}` : ""} right after starting. Check that the image runs on its own.`,
       );
@@ -373,13 +391,18 @@ export class DeploymentController {
     for (const build of this.builds.values()) {
       if (build.projectId === project.id) build.abort.abort();
     }
-    const images = (await this.repository.listDeployments(project.id, 1_000))
-      .map((deployment) => deployment.imageRef)
-      .filter((image): image is string => image !== null);
+    const deployments = await this.repository.listDeployments(project.id, 1_000);
+    // Images built for the project; pulled images (postgres, redis…) stay.
+    const images = deployments.flatMap((deployment) =>
+      deployment.compose
+        ? deployment.compose.services.filter((s) => !s.pull).map((s) => s.image)
+        : project.source.type === "repo" && deployment.imageRef
+          ? [deployment.imageRef]
+          : [],
+    );
     await this.runtime.remove(project.id);
-    if (project.source.type === "repo") {
-      for (const image of new Set(images)) await this.runtime.removeImage(image);
-    }
+    await this.runtime.removeData(project.id);
+    for (const image of new Set(images)) await this.runtime.removeImage(image);
     await this.repository.remove(project.id);
     this.logger.info({ projectId: project.id, name: project.name }, "project deleted");
   }

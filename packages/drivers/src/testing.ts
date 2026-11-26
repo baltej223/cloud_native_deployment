@@ -7,6 +7,7 @@ import {
   type AppSpec,
   type AppState,
   type AppTarget,
+  type ComposePlan,
   type Router,
   type Runtime,
 } from "./types.js";
@@ -62,6 +63,12 @@ export class FakeRuntime implements Runtime {
     this.removed.push(projectId);
     this.apps.delete(projectId);
   }
+
+  readonly removedData: string[] = [];
+
+  async removeData(projectId: string): Promise<void> {
+    this.removedData.push(projectId);
+  }
 }
 
 /** Router whose apps are healthy unless listed in `unhealthy`. */
@@ -82,6 +89,8 @@ export class FakeBuilder implements Builder {
   readonly requests: BuildRequest[] = [];
   /** Port the fake Dockerfile exposes. */
   exposedPort: number | null = 3000;
+  /** When set, builds "find" this compose plan. */
+  compose: ComposePlan | null = null;
   /** When set, builds fail with this reason. */
   failWith: string | null = null;
   /** Builds wait until released, so tests can observe the "building" state. */
@@ -107,6 +116,7 @@ export class FakeBuilder implements Builder {
       dockerfilePath: request.dockerfilePath ?? "Dockerfile",
       contextPath: ".",
       exposedPort: this.exposedPort,
+      ...(this.compose ? { compose: this.compose } : {}),
     };
   }
 

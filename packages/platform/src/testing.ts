@@ -184,6 +184,7 @@ export class InMemoryProjectRepository implements ProjectRepository {
       dockerfilePath: null,
       contextPath: null,
       containerPort: null,
+      compose: null,
       failureReason: null,
       createdAt: now,
       updatedAt: now,

@@ -3,12 +3,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { after, test } from "node:test";
-import {
-  chooseDockerfile,
-  dockerignoreExcludes,
-  findDockerfiles,
-  parseExposedPort,
-} from "./dockerfile.js";
+import { chooseDockerfile, findDockerfiles, parseExposedPort } from "./dockerfile.js";
 import { DeployError } from "./types.js";
 
 const roots: string[] = [];
@@ -107,11 +102,4 @@ test("EXPOSE variables resolve from ARG and ENV defaults", () => {
 
 test("comments, lower case and line continuations are handled", () => {
   assert.equal(parseExposedPort("# EXPOSE 1\nfrom node\nexpose \\\n  5173"), 5173);
-});
-
-test(".dockerignore becomes tar excludes", () => {
-  assert.deepEqual(
-    dockerignoreExcludes("# deps\nnode_modules\n/dist/\n**/*.log\n!keep.log\n\n.env\nDockerfile\n"),
-    ["node_modules", "dist", "*.log", ".env"],
-  );
 });

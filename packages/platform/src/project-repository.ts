@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
   canTransition,
+  type ComposePlan,
   type DeploymentStatus,
   type ProjectSource,
 } from "@cloud-platform/contracts";
@@ -31,6 +32,8 @@ export interface DeploymentRecord {
   dockerfilePath: string | null;
   contextPath: string | null;
   containerPort: number | null;
+  /** Compose apps: the services this deployment runs. */
+  compose: ComposePlan | null;
   failureReason: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -96,6 +99,7 @@ export interface TransitionFields {
   dockerfilePath?: string;
   contextPath?: string;
   containerPort?: number;
+  compose?: ComposePlan;
 }
 
 /** Work the deployment controller has to do. */
@@ -158,6 +162,7 @@ interface ProjectRow {
   repo_url: string | null;
   branch: string | null;
   dockerfile_path: string | null;
+  compose_service: string | null;
   container_port: number | null;
   health_check_path: string;
   env: Record<string, string>;
@@ -178,6 +183,7 @@ interface DeploymentRow {
   dockerfile_path: string | null;
   context_path: string | null;
   container_port: number | null;
+  compose: ComposePlan | null;
   failure_reason: string | null;
   created_at: Date | string;
   updated_at: Date | string;
@@ -197,6 +203,7 @@ function toProject(row: ProjectRow): ProjectRecord {
           repoUrl: row.repo_url!,
           ...(row.branch ? { branch: row.branch } : {}),
           ...(row.dockerfile_path ? { dockerfilePath: row.dockerfile_path } : {}),
+          ...(row.compose_service ? { composeService: row.compose_service } : {}),
         }
       : { type: "image", image: row.image! };
   return {
@@ -224,6 +231,7 @@ function toDeployment(row: DeploymentRow): DeploymentRecord {
     dockerfilePath: row.dockerfile_path,
     contextPath: row.context_path,
     containerPort: row.container_port,
+    compose: row.compose ?? null,
     failureReason: row.failure_reason,
     createdAt: date(row.created_at),
     updatedAt: date(row.updated_at),
@@ -234,12 +242,12 @@ function toDeployment(row: DeploymentRow): DeploymentRecord {
 }
 
 const PROJECT_COLUMNS = `p.id, p.name, p.source_type, p.image, p.repo_url, p.branch, p.dockerfile_path,
-  p.container_port, p.health_check_path, p.env, p.assigned_port, p.desired_state, p.deleted_at,
+  p.compose_service, p.container_port, p.health_check_path, p.env, p.assigned_port, p.desired_state, p.deleted_at,
   p.created_at, p.updated_at`;
 
 /** Everything except the (large) build log. */
 const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.status, d.image_ref, d.commit_sha, d.dockerfile_path,
-  d.context_path, d.container_port, d.failure_reason, d.created_at, d.updated_at, d.started_at,
+  d.context_path, d.container_port, d.compose, d.failure_reason, d.created_at, d.updated_at, d.started_at,
   d.deploy_started_at, d.finished_at`;
 
 /** A project with its latest and live deployments as JSON columns. */
@@ -307,8 +315,9 @@ export class PostgresProjectRepository implements ProjectRepository {
       try {
         const { rows } = await client.query<ProjectRow>(
           `INSERT INTO projects AS p (id, name, source_type, image, repo_url, branch,
-             dockerfile_path, container_port, health_check_path, env, assigned_port)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             dockerfile_path, container_port, health_check_path, env, assigned_port,
+             compose_service)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
            RETURNING ${PROJECT_COLUMNS}`,
           [
             randomUUID(),
@@ -322,6 +331,7 @@ export class PostgresProjectRepository implements ProjectRepository {
             input.healthCheckPath,
             JSON.stringify(input.env),
             port,
+            source.type === "repo" ? (source.composeService ?? null) : null,
           ],
         );
         projectRow = rows[0]!;
@@ -465,7 +475,8 @@ export class PostgresProjectRepository implements ProjectRepository {
                   commit_sha = coalesce($6, commit_sha),
                   dockerfile_path = coalesce($7, dockerfile_path),
                   context_path = coalesce($8, context_path),
-                  container_port = coalesce($9, container_port)
+                  container_port = coalesce($9, container_port),
+                  compose = coalesce($10, compose)
             WHERE id = $1 AND status = $2
             RETURNING ${DEPLOYMENT_COLUMNS}`,
           [
@@ -478,6 +489,7 @@ export class PostgresProjectRepository implements ProjectRepository {
             fields.dockerfilePath ?? null,
             fields.contextPath ?? null,
             fields.containerPort ?? null,
+            fields.compose ? JSON.stringify(fields.compose) : null,
           ],
         );
         // Roll back the supersede above if this deployment had already moved on.

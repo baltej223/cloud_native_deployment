@@ -204,12 +204,29 @@ export default function ProjectPage() {
                 </dd>
                 {isRepo && (
                   <>
-                    <dt>Dockerfile</dt>
-                    <dd className="mono">
-                      {latest?.dockerfilePath ??
-                        (project.source.type === "repo" && project.source.dockerfilePath) ??
-                        "found automatically"}
-                    </dd>
+                    {latest?.compose ? (
+                      <>
+                        <dt>Compose file</dt>
+                        <dd className="mono">{latest.compose.file}</dd>
+                        <dt>Services</dt>
+                        <dd className="mono">
+                          {latest.compose.services
+                            .map((name) =>
+                              name === latest.compose!.publicService ? `${name} (URL)` : name,
+                            )
+                            .join(", ")}
+                        </dd>
+                      </>
+                    ) : (
+                      <>
+                        <dt>Dockerfile</dt>
+                        <dd className="mono">
+                          {latest?.dockerfilePath ??
+                            (project.source.type === "repo" && project.source.dockerfilePath) ??
+                            "compose file or found automatically"}
+                        </dd>
+                      </>
+                    )}
                     <dt>Commit</dt>
                     <dd className="mono">{shortSha(latest?.commitSha ?? null)}</dd>
                   </>
@@ -217,7 +234,11 @@ export default function ProjectPage() {
                 <dt>Container port</dt>
                 <dd>
                   {latest?.containerPort ?? project.containerPort ?? "from EXPOSE"}
-                  {project.containerPort === null && latest?.containerPort ? " (from EXPOSE)" : ""}
+                  {project.containerPort === null && latest?.containerPort
+                    ? latest.compose
+                      ? " (from the compose file)"
+                      : " (from EXPOSE)"
+                    : ""}
                 </dd>
                 <dt>Health check</dt>
                 <dd className="mono">{project.healthCheckPath}</dd>

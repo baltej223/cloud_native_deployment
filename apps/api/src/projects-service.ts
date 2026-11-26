@@ -55,6 +55,13 @@ export function toDeploymentView(deployment: DeploymentRecord): DeploymentView {
     imageRef: deployment.imageRef,
     commitSha: deployment.commitSha,
     dockerfilePath: deployment.dockerfilePath,
+    compose: deployment.compose
+      ? {
+          file: deployment.compose.file,
+          publicService: deployment.compose.publicService,
+          services: deployment.compose.services.map((service) => service.name),
+        }
+      : null,
     containerPort: deployment.containerPort,
     failureReason: deployment.failureReason,
     createdAt: deployment.createdAt.toISOString(),

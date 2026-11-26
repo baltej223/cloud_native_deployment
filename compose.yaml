@@ -1,8 +1,8 @@
 # Local platform: docker compose up --build
 # Values come from .env when present (copy .env.example), otherwise the defaults below.
 #
-# The API starts user apps as sibling containers through the host's Docker or
-# Podman socket (HOST_CONTAINER_SOCKET). Those containers publish their ports
+# The API builds and starts user apps as sibling containers through the host's
+# Docker socket (HOST_CONTAINER_SOCKET). Those containers publish their ports
 # on the host (APP_PORT_RANGE), so app URLs look like http://localhost:8001.
 
 name: cloud-platform
@@ -42,6 +42,7 @@ services:
 
   migrate:
     build: { context: ., target: migrate }
+    image: localhost/cloud-platform-migrate:latest
     environment: *database-env
     depends_on:
       # Not required: with USE_SUPABASE=yes there is no local postgres to wait for.
@@ -50,6 +51,7 @@ services:
 
   api:
     build: { context: ., target: api }
+    image: localhost/cloud-platform-api:latest
     environment:
       <<: *database-env
       API_PORT: 3001
@@ -67,10 +69,10 @@ services:
       DEPLOY_HEALTH_TIMEOUT_SECONDS: ${DEPLOY_HEALTH_TIMEOUT_SECONDS:-120}
       BUILD_TIMEOUT_SECONDS: ${BUILD_TIMEOUT_SECONDS:-900}
     # Local development only: the container engine socket gives the API full
-    # control of the host's containers. On a rootless engine (Podman) the
-    # socket belongs to your user, which is root inside the container, so the
-    # API runs as root here; SELinux labelling is disabled so it may open the
-    # socket. The production image runs as an unprivileged user.
+    # control of the host's containers. The socket is only writable by root
+    # and the docker group, so the API runs as root here; SELinux labelling is
+    # disabled so it may open the socket. The production image runs as an
+    # unprivileged user.
     user: "0"
     security_opt: ["label=disable"]
     volumes:
@@ -94,6 +96,7 @@ services:
     restart: unless-stopped
 
   web:
+    image: localhost/cloud-platform-web:latest
     build:
       context: .
       target: web

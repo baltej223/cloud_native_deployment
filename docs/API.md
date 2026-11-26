@@ -27,7 +27,8 @@ Every other field is an optional override:
     "type": "repo",
     "repoUrl": "https://github.com/dockersamples/example-voting-app",
     "branch": "main",
-    "dockerfilePath": "vote/Dockerfile"
+    "dockerfilePath": "vote/Dockerfile",
+    "composeService": "vote"
   },
   "containerPort": 80,
   "healthCheckPath": "/",
@@ -49,12 +50,15 @@ Or deploy a ready-made image (then `name` and `containerPort` are required):
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `source.repoUrl`        | Public `https://github.com/<owner>/<repo>`; `.git` and a trailing slash are accepted and removed                                                       |
 | `source.branch`         | Optional; default is the repository's default branch                                                                                                   |
-| `source.dockerfilePath` | Optional path inside the repository; default is found automatically (see below)                                                                        |
+| `source.dockerfilePath` | Optional path inside the repository; default is found automatically (see below). Setting it skips the compose file                                     |
+| `source.composeService` | Optional. For compose apps, the service that gets the URL; default is the one service that publishes a port                                            |
 | `source.image`          | Docker image reference. Short names are expanded: `nginx` → `docker.io/library/nginx:latest`                                                           |
 | `name`                  | 3-30 characters: lowercase letters, digits, hyphens; starts with a letter. Unique. Default for repositories: the repository name (`My_App` → `my-app`) |
 | `containerPort`         | Port the app listens on, 1-65535. Default for repositories: the Dockerfile's `EXPOSE` port. A given port always wins                                   |
 | `healthCheckPath`       | Optional, default `/`. The app is live once this path answers with a status below 500                                                                  |
 | `env`                   | Optional. Keys like `MY_VAR`, at most 50; values up to 4096 characters. Not for secrets. `PORT` is set automatically unless you set it                 |
+
+**Compose file:** a `compose.yaml`, `compose.yml`, `docker-compose.yaml` or `docker-compose.yml` at the repository root is used first (unless `dockerfilePath` is set). Every service runs: services with `build` are built, services with `image` are pulled, and they reach each other by service name on a network private to the project. One service gets the URL: the one that publishes a port (`ports:`), or `composeService`. Its container port is that `ports:` entry's container side, else its `expose:`, else its Dockerfile's `EXPOSE`. Supported per service: `image`, `build` (`context`, `dockerfile`, `args`, `target`), `command`, `entrypoint`, `environment`, `env_file`, `ports`, `expose`, `depends_on` (start order only), `restart`, `volumes`, `working_dir`, `user`; services with `profiles` are skipped. `${VAR}` references are filled from the repository's `.env` and the project's `env` (which wins); the project's `env` is not otherwise added to the services, and `PORT` is not set. Named volumes keep their data across redeploys and are deleted with the project. Repository folders a service mounts (`./src:/app`) are copied into its image instead. Refused: host paths (`/var/run/docker.sock:…`), `privileged`, `network_mode`, `cap_add`, `devices`, `pid`, `ipc`, `security_opt`, `secrets`, `configs`, `extends`, external volumes and other settings that reach into the host. At most 5 services; each gets the per-app memory and CPU limits. Other settings (`healthcheck`, `networks`, `deploy`, …) are ignored and listed in the build log.
 
 **Dockerfile discovery:** a `Dockerfile` (or `Containerfile`) at the root wins. Otherwise the platform searches up to three folders deep, skipping hidden folders, `node_modules`, `vendor` and test folders. Exactly one match is used, with its folder as the build context. Several matches fail and list them; set `source.dockerfilePath` to pick one.
 
@@ -83,6 +87,7 @@ Response:
     "imageRef": null,
     "commitSha": null,
     "dockerfilePath": null,
+    "compose": null,
     "containerPort": null,
     "failureReason": null,
     "createdAt": "2026-11-26T13:39:40.120Z",
@@ -92,7 +97,7 @@ Response:
 }
 ```
 
-Once built, the deployment records what was used: `imageRef`, `commitSha`, `dockerfilePath` and the `containerPort` (given or detected).
+Once built, the deployment records what was used: `imageRef`, `commitSha`, `dockerfilePath` and the `containerPort` (given or detected). For compose apps, `dockerfilePath` is the compose file and `compose` is `{ "file": "docker-compose.yml", "publicService": "vote", "services": ["redis", "vote", "db", "result", "worker"] }` (start order); `imageRef` is the public service's image.
 
 Errors: `400 INVALID_INPUT`, `409 NAME_TAKEN` (for a derived name, set `name`), `409 PROJECT_LIMIT_REACHED` (default limit 10), `409 NO_FREE_PORT`.
 
@@ -159,6 +164,8 @@ Typical failure reasons:
 - `Repository https://github.com/a/b was not found, or it is private.`
 - `Branch dev does not exist in https://github.com/a/b.`
 - `No Dockerfile found in https://github.com/a/b (looked in the root and up to 3 folders deep). Add a Dockerfile to the repository.`
+- `Several services in docker-compose.yml publish ports: vote, result. Choose the one that gets the URL with the Compose service setting and deploy again.`
+- `compose.yaml, service app mounts /var/run/docker.sock from the host, which the platform does not allow. Use a named volume.`
 - `Found several Dockerfiles: api/Dockerfile, web/Dockerfile. Choose one with the Dockerfile path setting and deploy again.`
 - `Dockerfile has no EXPOSE instruction, so the port the app listens on is unknown. Set the container port and deploy again.`
 - `The build failed: … See the build log for details.`

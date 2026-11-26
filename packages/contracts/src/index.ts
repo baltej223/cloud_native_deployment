@@ -150,6 +150,19 @@ const repoSourceSchema = z.object({
     .trim()
     .regex(REPO_PATH_PATTERN, "source.dockerfilePath must be a path inside the repository.")
     .optional(),
+  /**
+   * Compose apps: the service that gets the URL. Default: the one that
+   * publishes a port. A compose file at the root is used unless
+   * dockerfilePath is set.
+   */
+  composeService: z
+    .string()
+    .trim()
+    .regex(
+      /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$/,
+      "source.composeService is not a valid service name.",
+    )
+    .optional(),
 });
 
 /** A GitHub repository (the main way to deploy) or a ready-made Docker image. */
@@ -237,6 +250,47 @@ export type CreateProjectInput = z.output<typeof createProjectRequestSchema>;
 export const PORT_ENV_VAR = "PORT";
 
 // ---------------------------------------------------------------------------
+// Compose apps (stored with each deployment)
+// ---------------------------------------------------------------------------
+
+/** A named volume of a compose service; the data survives redeploys. */
+export interface VolumeMount {
+  /** Volume name from the compose file. */
+  name: string;
+  target: string;
+  readOnly: boolean;
+}
+
+/** One service of a compose file, ready to run. */
+export interface ServiceSpec {
+  /** Service name; other services reach it by this host name. */
+  name: string;
+  image: string;
+  /** Pull the image first (registry images); false for images built here. */
+  pull: boolean;
+  command: string[] | null;
+  entrypoint: string[] | null;
+  env: Record<string, string>;
+  volumes: VolumeMount[];
+  /** Anonymous volumes (container paths); removed with the container. */
+  tmpVolumes: string[];
+  workingDir: string | null;
+  user: string | null;
+  /** Docker restart policy name. */
+  restart: "no" | "always" | "unless-stopped" | "on-failure";
+  dependsOn: string[];
+}
+
+/** What a compose file deploys: its services and the one that gets the URL. */
+export interface ComposePlan {
+  /** Compose file, relative to the repository root. */
+  file: string;
+  publicService: string;
+  /** All services, in start order (dependencies first). */
+  services: ServiceSpec[];
+}
+
+// ---------------------------------------------------------------------------
 // API responses
 // ---------------------------------------------------------------------------
 
@@ -248,8 +302,10 @@ export interface DeploymentView {
   imageRef: string | null;
   /** Repository commit that was built. */
   commitSha: string | null;
-  /** Dockerfile that was used, relative to the repository root. */
+  /** Dockerfile (or compose file) that was used, relative to the repository root. */
   dockerfilePath: string | null;
+  /** Compose apps: the compose file used, its services, and the one with the URL. */
+  compose: { file: string; publicService: string; services: string[] } | null;
   /** Port the app listens on in this deployment (given, or detected from EXPOSE). */
   containerPort: number | null;
   /** Safe, human-readable reason when status is "failed". */

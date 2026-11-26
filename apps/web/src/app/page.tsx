@@ -41,6 +41,7 @@ export default function Dashboard() {
   const [name, setName] = useState("");
   const [branch, setBranch] = useState("");
   const [dockerfilePath, setDockerfilePath] = useState("");
+  const [composeService, setComposeService] = useState("");
   const [port, setPort] = useState("");
   const [healthPath, setHealthPath] = useState("/");
   const [envText, setEnvText] = useState("");
@@ -81,6 +82,7 @@ export default function Dashboard() {
                 repoUrl: repoUrl.trim(),
                 ...(branch.trim() ? { branch: branch.trim() } : {}),
                 ...(dockerfilePath.trim() ? { dockerfilePath: dockerfilePath.trim() } : {}),
+                ...(composeService.trim() ? { composeService: composeService.trim() } : {}),
               }
             : { type: "image", image: image.trim() },
         ...(port.trim() ? { containerPort: Number(port) } : {}),
@@ -101,8 +103,8 @@ export default function Dashboard() {
         <p className="eyebrow">Cloud Deploy</p>
         <h1>Paste a repo, get a URL.</h1>
         <p className="intro">
-          Point the platform at a public GitHub repository. It finds the Dockerfile, builds it, runs
-          it and hands you a link. No configuration needed.
+          Point the platform at a public GitHub repository. It uses the compose file or finds the
+          Dockerfile, builds it, runs it and hands you a link. No configuration needed.
         </p>
 
         <form className="card form" onSubmit={onSubmit}>
@@ -194,7 +196,15 @@ export default function Dashboard() {
                     <input
                       value={dockerfilePath}
                       onChange={(event) => setDockerfilePath(event.target.value)}
-                      placeholder="found automatically"
+                      placeholder="found automatically; set to skip the compose file"
+                    />
+                  </label>
+                  <label>
+                    Compose service
+                    <input
+                      value={composeService}
+                      onChange={(event) => setComposeService(event.target.value)}
+                      placeholder="the one that publishes a port"
                     />
                   </label>
                   <label>

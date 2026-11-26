@@ -144,24 +144,3 @@ export function parseExposedPort(content: string): number | null {
   }
   return port;
 }
-
-/**
- * Exclude patterns for tar from a .dockerignore file. The engine API expects
- * the client to apply .dockerignore, as the docker CLI does. Negations ("!")
- * are not supported by tar and are skipped, so such files are left out.
- */
-export function dockerignoreExcludes(content: string): string[] {
-  const patterns: string[] = [];
-  for (const raw of content.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("#") || line.startsWith("!")) continue;
-    const pattern = line
-      .replace(/^\/+/, "")
-      .replace(/^\*\*\//, "")
-      .replace(/\/+$/, "");
-    if (pattern && pattern !== "Dockerfile" && pattern !== "." && pattern !== "*") {
-      patterns.push(pattern);
-    }
-  }
-  return patterns;
-}

@@ -9,13 +9,13 @@ Browser
   └── Next.js dashboard
         └── Node.js API ─────────── PostgreSQL (projects, deployments: desired state)
               └── Deployment controller (reconciliation loop inside the API)
-                    ├── Builder  : clone repo + docker build + push   (local: Docker/Podman, AWS: CodeBuild → ECR)
-                    ├── Runtime  : run the app container              (local: Docker/Podman, AWS: ECS Fargate service)
+                    ├── Builder  : clone repo + docker build + push   (local: Docker, AWS: CodeBuild → ECR)
+                    ├── Runtime  : run the app container              (local: Docker, AWS: ECS Fargate service)
                     └── Router   : give the app a URL                 (local: host port,     AWS: ALB listener port or host rule)
 
 Platform on AWS: ECS (web, api), ECR, ALB, CodeBuild, CloudWatch, IAM, SSM Parameter Store, CloudFormation
 Platform CI/CD:  GitHub Actions → ECR → ECS
-Local development: Docker Compose, PostgreSQL, Docker/Podman socket for running user apps
+Local development: Docker Compose, PostgreSQL, Docker socket for running user apps
 ```
 
 There is no message queue. PostgreSQL records what should exist, and the deployment controller makes the real infrastructure match it. The three drivers (Builder, Runtime, Router) are interfaces with a local implementation and an AWS implementation, so the same controller works on a laptop and on AWS.
@@ -41,7 +41,7 @@ Build the first working slice on a developer machine, without an AWS account. A 
 ### Work
 
 - Replace the job model with `projects` and `deployments` (see Phase 2 for the full fields; Phase 1 needs only the image source).
-- Define the `Runtime` and `Router` interfaces and implement the local versions with the Docker Engine API over the Docker/Podman socket.
+- Define the `Runtime` and `Router` interfaces and implement the local versions with the Docker Engine API over the Docker socket.
 - Implement the first version of the deployment controller: pull the image, start the container with a host port from a fixed range (8001-8050), wait until the port responds, mark the deployment `live`.
 - Build the dashboard: a "New project" form (name, image, port, environment variables), a project list with status and URL, and a project page that polls status.
 - Remove the queue, worker, S3 and image-processing code and their Compose services.
@@ -125,6 +125,7 @@ Make the deployment controller safe to restart and run in parallel, and add the 
 
 ### Work
 
+- **Compose apps (done first).** A compose file at the repository root (`compose.yaml`, `compose.yml`, `docker-compose.yaml`, `docker-compose.yml`) is used instead of Dockerfile discovery, unless a Dockerfile path is set. The platform reads the file itself and runs each service through the engine API (no compose CLI): built services are built, image services pulled, all on a network private to the project. Only one service gets the URL (the one that publishes a port, or `composeService`). Named volumes are kept across redeploys and removed with the project; repository folders a service mounts are copied into its image; host paths, privileged mode, host networking, devices, capabilities and similar settings are refused. At most 5 services per project, each with the per-app memory and CPU limits.
 - Run the controller as a reconciliation loop: each tick reads unfinished deployments and projects whose desired state differs from the actual state, and moves each one forward one step.
 - Make each step idempotent: name every resource after the project ID and check before creating. A crash between steps must not create duplicates or lose a deployment.
 - Use a PostgreSQL advisory lock so only one API instance runs the controller.
