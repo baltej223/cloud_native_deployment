@@ -45,11 +45,16 @@ export const loadConfig = () =>
     APP_CPUS: z.coerce.number().min(0.1).max(4).default(0.5),
     MAX_PROJECTS: z.coerce.number().int().min(1).max(1_000).default(10),
 
+    /** Where repositories are cloned for builds (one temporary folder per build). */
+    BUILD_WORK_DIR: z.string().min(1).default("/tmp/cloud-platform-builds"),
+    /** How long a build (clone + docker build) may take. */
+    BUILD_TIMEOUT_SECONDS: z.coerce.number().int().min(30).default(900),
+
     /** How often the deployment controller looks for work. */
     CONTROLLER_INTERVAL_MS: z.coerce.number().int().min(250).default(2_000),
     /** How long a started app gets to answer its health check before it fails. */
     DEPLOY_HEALTH_TIMEOUT_SECONDS: z.coerce.number().int().min(5).default(120),
-    /** Upper bound for a whole deployment, including pulling the image. */
+    /** Upper bound for the deploy step (after any build), including pulling the image. */
     DEPLOY_TIMEOUT_SECONDS: z.coerce.number().int().min(30).default(600),
   });
 

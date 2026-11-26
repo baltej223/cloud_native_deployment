@@ -1,8 +1,12 @@
 import type {
   ApiErrorResponse,
+  BuildLogResponse,
   CreateProjectRequest,
   CreateProjectResponse,
+  DeploymentView,
+  ListDeploymentsResponse,
   ListProjectsResponse,
+  ProjectSource,
   ProjectStatus,
   ProjectView,
 } from "@cloud-platform/contracts";
@@ -53,6 +57,32 @@ export const deleteProject = (id: string) =>
     { method: "DELETE" },
     "Could not delete the project.",
   );
+
+export const redeployProject = (id: string) =>
+  call<DeploymentView>(
+    `/projects/${id}/deployments`,
+    { method: "POST" },
+    "Could not start a new deployment.",
+  );
+
+export const listDeployments = async (projectId: string) =>
+  (
+    await call<ListDeploymentsResponse>(
+      `/projects/${projectId}/deployments`,
+      {},
+      "Could not load deployments.",
+    )
+  ).deployments;
+
+export const getBuildLog = (deploymentId: string) =>
+  call<BuildLogResponse>(`/deployments/${deploymentId}/logs`, {}, "Could not load the build log.");
+
+/** Short description of where a project comes from: "owner/repo" or the image. */
+export function describeSource(source: ProjectSource): string {
+  if (source.type === "image") return source.image.replace(/^docker\.io\/(library\/)?/, "");
+  const repo = source.repoUrl.replace(/^https:\/\/github\.com\//, "");
+  return source.branch ? `${repo} @ ${source.branch}` : repo;
+}
 
 /** Statuses that will change on their own, so the dashboard keeps polling. */
 export const isSettling = (status: ProjectStatus) =>

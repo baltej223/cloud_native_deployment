@@ -91,8 +91,7 @@ Deployment states: `pending` → `building` (repository only) → `deploying` �
 - `GET /projects`, `GET /projects/:id`: current state, URL and latest deployment.
 - `POST /projects/:id/deployments`: redeploy (build again or pull again).
 - `GET /projects/:id/deployments`, `GET /deployments/:id`: history and status.
-- `GET /deployments/:id/logs`: build logs. `GET /projects/:id/logs`: runtime logs.
-- `PATCH /projects/:id`: change env vars, port or health check path (takes effect on the next deployment).
+- `GET /deployments/:id/logs`: build logs.
 - `DELETE /projects/:id`: tear the app down.
 - Health endpoints: `GET /health/live`, `GET /health/ready`.
 
@@ -132,7 +131,8 @@ Make the deployment controller safe to restart and run in parallel, and add the 
 - Add timeouts: build (15 minutes), health check (5 minutes). Mark the deployment `failed` with the reason when a timeout is hit.
 - Keep the previous live version serving until the new one is healthy; on failure, the old version stays live.
 - Add redeploy, roll back (redeploy an earlier image without rebuilding), stop, start and delete.
-- Add runtime logs and auto-stop after the idle period (default 2 hours, configurable).
+- Add `PATCH /projects/:id` to change env vars, port or health check path (takes effect on the next deployment).
+- Add runtime logs (`GET /projects/:id/logs`) and auto-stop after the idle period (default 2 hours, configurable).
 
 ### Deliverable
 

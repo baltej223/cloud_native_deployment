@@ -1,12 +1,12 @@
 # Cloud Deploy
 
-A small platform-as-a-service: give it a Docker image (and, from Phase 2, a GitHub repository) plus the port the app listens on, and it runs the app and gives you a URL.
+A small platform-as-a-service: paste a public GitHub repository URL, and the platform clones it, finds the Dockerfile, builds it, runs it and gives you a URL. Deploying a ready-made Docker image is also possible.
 
 - Design: [cloud_platform_baseline.md](cloud_platform_baseline.md)
 - Plan: [phase-wise-implementation.md](phase-wise-implementation.md)
 - API: [docs/API.md](docs/API.md)
 
-**Status:** Phase 1 (deploy a Docker image locally) is implemented.
+**Status:** Phases 1 and 2 are implemented: deploy from a GitHub repository or a Docker image, locally.
 
 ## How it works
 
@@ -17,20 +17,24 @@ Browser ── Next.js dashboard (:3000)
           Express API (:3001) ── PostgreSQL: projects + deployments (desired state)
               │
               └── Deployment controller (loop inside the API)
-                    └── Docker / Podman API socket
+                    ├── Builder: git clone → find Dockerfile → read EXPOSE → docker build
+                    └── Runtime: Docker / Podman API socket
                           ├── cp-app-<project id>  → http://localhost:8001
                           ├── cp-app-<project id>  → http://localhost:8002
                           └── …
 ```
 
-1. `POST /projects` validates the request, picks a free port (8001-8050) and stores the project with a `pending` deployment. It returns immediately.
-2. The controller, which checks the database every 2 seconds, moves the deployment to `deploying`, pulls the image and starts a container that publishes the app on the project's port.
-3. Once the app answers HTTP on its health check path, the deployment becomes `live`. If the image does not exist, the container crashes, or the app never answers (120 s), it becomes `failed` with a readable reason, and the container is removed.
-4. Deleting a project removes its container, then its record, which frees the name and port.
+1. `POST /projects` validates the request, picks a free port (8001-8050) and stores the project with a `pending` deployment. It returns immediately. For a repository, the project name defaults to the repository name.
+2. The controller checks the database every 2 seconds and takes the next step for each deployment:
+   - **building** (repositories): shallow-clone the repository, find the Dockerfile (root first, then up to three folders deep, skipping `node_modules`, `.git`, `vendor` and test folders), read the port from the final stage's `EXPOSE`, and build the image through the engine's build API. Output appears live in the dashboard's build log.
+   - **deploying**: start a container that publishes the app on the project's port. The app also gets `PORT` set to its container port. Image sources pull the image first.
+3. Once the app answers HTTP on its health check path, the deployment becomes `live`. Otherwise it becomes `failed` with a readable reason: repository not found, no Dockerfile, several Dockerfiles (listed, so you can pick one), no port, build error, crash on start, or no answer within 120 s.
+4. **Redeploy** builds the latest commit again. The old version keeps serving until the new one is live; if the new one fails, the old one is started again.
+5. Deleting a project removes its container and built images, then its record, which frees the name and port.
 
-There is no queue: the database records what should exist, and the controller makes the container engine match it. Every step is safe to repeat, so restarting the platform resumes unfinished deployments.
+There is no queue: the database records what should exist, and the controller makes the container engine match it. Every step is safe to repeat, so restarting the platform resumes unfinished deployments; an interrupted build starts again.
 
-**Isolation:** apps run on their own network (`cloud-platform-apps`), separate from the database. Each app is limited to 512 MB of memory and half a CPU, and gets no platform credentials.
+**Isolation:** apps run on their own network (`cloud-platform-apps`), separate from the database. Each app is limited to 512 MB of memory and half a CPU, and gets no platform credentials. Builds time out after 15 minutes, and build contexts over 500 MB are refused.
 
 ## Run it locally
 
@@ -41,16 +45,19 @@ cp .env.example .env          # optional; every value has a default
 docker compose up --build
 ```
 
-Open http://localhost:3000, enter a name, an image such as `nginx:alpine` and port `80`, and press **Deploy**. When the project shows **Live**, open its URL.
+Open http://localhost:3000, paste a repository URL, and press **Deploy**. Follow the build log on the project page; when it shows **Live**, open its URL.
 
-Things to try:
+Things to try (all tested):
 
-| Image                 | Port | Result                                      |
-| --------------------- | ---- | ------------------------------------------- |
-| `nginx:alpine`        | 80   | Live; nginx welcome page                    |
-| `traefik/whoami`      | 80   | Live; prints request details                |
-| `nginx:alpine`        | 9999 | Failed after 120 s: nothing answers on 9999 |
-| `no-such/image-xyz:1` | 80   | Failed: image not found                     |
+| Repository URL                                        | Result                                        |
+| ----------------------------------------------------- | --------------------------------------------- |
+| `https://github.com/traefik/whoami`                   | Live; Go app, port 80 from `EXPOSE`           |
+| `https://github.com/docker/welcome-to-docker`         | Live; React app, port 3000 from `EXPOSE`      |
+| `https://github.com/dockersamples/example-voting-app` | Failed: lists its four Dockerfiles            |
+| same, with Dockerfile path `vote/Dockerfile`          | Live; the "Cats vs Dogs" app from a subfolder |
+| `https://github.com/docker/getting-started-app`       | Failed: no Dockerfile                         |
+
+On the **Docker image** tab, `nginx:alpine` with port 80 goes live without a build.
 
 ### With Podman (rootless)
 
@@ -72,7 +79,9 @@ docker rm -f $(docker ps -aq --filter label=cloud-platform.project)   # remove a
 docker network rm cloud-platform-apps
 ```
 
-Deleting projects in the dashboard first removes their containers for you.
+Deleting projects in the dashboard first removes their containers and built images for you.
+
+To remove leftover built images: `docker rmi $(docker images -q --filter reference='localhost/cp-app-*')`.
 
 ### Hosted database (Supabase)
 
@@ -93,8 +102,11 @@ With `USE_SUPABASE=yes`, Compose does not start the local postgres container. Us
 ```bash
 npm install
 npm run typecheck
-npm test              # contracts, repository rules, API routes and controller (fake drivers)
+npm test              # contracts, Dockerfile discovery, API routes and controller (fake drivers)
 npm run format:check
+
+# Repository tests against a real, throwaway PostgreSQL (the database is wiped):
+TEST_DATABASE_URL=postgres://app:app@localhost:5434/cloud_platform_test npm test -w @cloud-platform/platform
 ```
 
 | Path                 | What it is                                                       |

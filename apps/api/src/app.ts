@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { ListProjectsResponse } from "@cloud-platform/contracts";
+import type { ListDeploymentsResponse, ListProjectsResponse } from "@cloud-platform/contracts";
 import type { Logger } from "@cloud-platform/platform";
 import cors from "cors";
 import express, { type ErrorRequestHandler, type RequestHandler } from "express";
@@ -91,6 +91,29 @@ export function createApp({ projects, logger, allowedOrigins, readinessChecks }:
   app.delete("/projects/:id", async (request, response) => {
     await projects.delete(request.params.id);
     response.status(202).json({ id: request.params.id, status: "deleting" });
+  });
+
+  app.post("/projects/:id/deployments", async (request, response) => {
+    const deployment = await projects.redeploy(request.params.id);
+    response.status(202).location(`/deployments/${deployment.id}`).json(deployment);
+  });
+
+  app.get("/projects/:id/deployments", async (request, response) => {
+    const body: ListDeploymentsResponse = {
+      deployments: await projects.listDeployments(request.params.id),
+    };
+    response.setHeader("Cache-Control", "no-store");
+    response.json(body);
+  });
+
+  app.get("/deployments/:id", async (request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.json(await projects.getDeployment(request.params.id));
+  });
+
+  app.get("/deployments/:id/logs", async (request, response) => {
+    response.setHeader("Cache-Control", "no-store");
+    response.json(await projects.getBuildLog(request.params.id));
   });
 
   app.use((_request, _response, next) => {

@@ -58,7 +58,7 @@ test("POST /projects creates a project with a pending deployment and a URL", asy
   assert.equal(response.headers.get("location"), `/projects/${body.project.id}`);
   assert.equal(body.project.status, "pending");
   assert.equal(body.project.url, "http://apps.test:8001");
-  assert.equal(body.project.source.image, "docker.io/library/nginx:alpine");
+  assert.deepEqual(body.project.source, { type: "image", image: "docker.io/library/nginx:alpine" });
   assert.equal(body.project.healthCheckPath, "/");
   assert.deepEqual(body.project.env, { GREETING: "hi" });
   assert.equal(body.deployment.status, "pending");
@@ -109,10 +109,17 @@ test("invalid requests return 400 with a readable message and create nothing", a
       { name: "Bad Name", source: { type: "image", image: "nginx" }, containerPort: 80 },
       /lowercase/,
     ],
+    [{ name: "okname", source: { type: "zip" }, containerPort: 80 }, /"repo" or "image"/],
+    [{ source: { type: "repo", repoUrl: "https://gitlab.com/a/b" } }, /public GitHub repository/],
     [
-      { name: "okname", source: { type: "repo" }, containerPort: 80 },
-      /source.type must be "image"/,
+      { source: { type: "repo", repoUrl: "https://github.com/a/b", branch: "--upload-pack=x" } },
+      /not a valid branch/,
     ],
+    [
+      { source: { type: "repo", repoUrl: "https://github.com/a/b", dockerfilePath: "../x" } },
+      /inside the repository/,
+    ],
+    [{ name: "okname", source: { type: "image", image: "nginx" } }, /containerPort is required/],
     [
       { name: "okname", source: { type: "image", image: "NOT VALID" }, containerPort: 80 },
       /not a valid image/,

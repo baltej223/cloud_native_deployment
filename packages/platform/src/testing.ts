@@ -5,6 +5,8 @@ import {
   type DeploymentStatus,
 } from "@cloud-platform/contracts";
 import {
+  BUILD_LOG_MAX_CHARS,
+  DeploymentInProgressError,
   NameTakenError,
   NoFreePortError,
   ProjectLimitError,
@@ -22,7 +24,11 @@ import {
 export class InMemoryProjectRepository implements ProjectRepository {
   readonly projects = new Map<string, ProjectRecord>();
   readonly deployments = new Map<string, DeploymentRecord>();
+  readonly buildLogs = new Map<string, string>();
   available = true;
+  /** Orders deployments created in the same millisecond. */
+  private sequence = 0;
+  private readonly order = new Map<string, number>();
 
   async ping(): Promise<void> {
     if (!this.available) throw new Error("database unavailable");
@@ -57,19 +63,8 @@ export class InMemoryProjectRepository implements ProjectRepository {
       createdAt: now,
       updatedAt: now,
     };
-    const deployment: DeploymentRecord = {
-      id: randomUUID(),
-      projectId: project.id,
-      status: "pending",
-      imageRef: null,
-      failureReason: null,
-      createdAt: now,
-      updatedAt: now,
-      startedAt: null,
-      finishedAt: null,
-    };
     this.projects.set(project.id, project);
-    this.deployments.set(deployment.id, deployment);
+    const deployment = this.newDeployment(project.id);
     return { project: { ...project }, deployment: { ...deployment } };
   }
 
@@ -91,8 +86,37 @@ export class InMemoryProjectRepository implements ProjectRepository {
     return true;
   }
 
+  async createDeployment(projectId: string): Promise<DeploymentRecord | null> {
+    const project = this.projects.get(projectId);
+    if (!project || project.deletedAt) return null;
+    if (this.deploymentsOf(projectId).some((d) => isActiveDeployment(d.status))) {
+      throw new DeploymentInProgressError();
+    }
+    return { ...this.newDeployment(projectId) };
+  }
+
+  async listDeployments(projectId: string, limit = 20): Promise<DeploymentRecord[]> {
+    return this.deploymentsOf(projectId)
+      .slice(0, limit)
+      .map((deployment) => ({ ...deployment }));
+  }
+
+  async getDeployment(id: string): Promise<DeploymentRecord | null> {
+    const deployment = this.deployments.get(id);
+    return deployment ? { ...deployment } : null;
+  }
+
+  async getBuildLog(id: string): Promise<string | null> {
+    return this.deployments.has(id) ? (this.buildLogs.get(id) ?? "") : null;
+  }
+
+  async setBuildLog(id: string, log: string): Promise<void> {
+    if (this.deployments.has(id)) this.buildLogs.set(id, log.slice(-BUILD_LOG_MAX_CHARS));
+  }
+
   async findWork(): Promise<ControllerWork> {
-    const deployments = [...this.deployments.values()]
+    const deployments = this.sorted([...this.deployments.values()])
+      .reverse()
       .filter((deployment) => isActiveDeployment(deployment.status))
       .map((deployment) => ({
         project: { ...this.projects.get(deployment.projectId)! },
@@ -116,26 +140,31 @@ export class InMemoryProjectRepository implements ProjectRepository {
     if (!deployment || deployment.status !== from) return null;
     const now = this.now();
     if (to === "live") {
-      for (const other of this.deployments.values()) {
-        if (other.projectId === deployment.projectId && other.status === "live") {
+      for (const other of this.deploymentsOf(deployment.projectId)) {
+        if (other.status === "live" && other.id !== id) {
           other.status = "superseded";
           other.updatedAt = now;
         }
       }
     }
     if (from === "pending") deployment.startedAt ??= now;
+    if (to === "deploying") deployment.deployStartedAt ??= now;
     if (to === "live" || to === "failed" || to === "cancelled") deployment.finishedAt ??= now;
     deployment.status = to;
     deployment.updatedAt = now;
-    if (fields.imageRef !== undefined) deployment.imageRef = fields.imageRef;
-    if (fields.failureReason !== undefined) deployment.failureReason = fields.failureReason;
+    for (const [key, value] of Object.entries(fields)) {
+      if (value !== undefined) (deployment as unknown as Record<string, unknown>)[key] = value;
+    }
     return { ...deployment };
   }
 
   async remove(id: string): Promise<void> {
     this.projects.delete(id);
     for (const [deploymentId, deployment] of this.deployments) {
-      if (deployment.projectId === id) this.deployments.delete(deploymentId);
+      if (deployment.projectId === id) {
+        this.deployments.delete(deploymentId);
+        this.buildLogs.delete(deploymentId);
+      }
     }
   }
 
@@ -144,10 +173,48 @@ export class InMemoryProjectRepository implements ProjectRepository {
     return new Date();
   }
 
+  private newDeployment(projectId: string): DeploymentRecord {
+    const now = this.now();
+    const deployment: DeploymentRecord = {
+      id: randomUUID(),
+      projectId,
+      status: "pending",
+      imageRef: null,
+      commitSha: null,
+      dockerfilePath: null,
+      contextPath: null,
+      containerPort: null,
+      failureReason: null,
+      createdAt: now,
+      updatedAt: now,
+      startedAt: null,
+      deployStartedAt: null,
+      finishedAt: null,
+    };
+    this.deployments.set(deployment.id, deployment);
+    this.order.set(deployment.id, this.sequence++);
+    return deployment;
+  }
+
+  /** Newest first. */
+  private sorted(deployments: DeploymentRecord[]): DeploymentRecord[] {
+    return deployments.sort((a, b) => this.order.get(b.id)! - this.order.get(a.id)!);
+  }
+
+  private deploymentsOf(projectId: string): DeploymentRecord[] {
+    return this.sorted(
+      [...this.deployments.values()].filter((deployment) => deployment.projectId === projectId),
+    );
+  }
+
   private withLatest(project: ProjectRecord): ProjectWithLatest {
-    const latest = [...this.deployments.values()]
-      .filter((deployment) => deployment.projectId === project.id)
-      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0];
-    return { project: { ...project }, latest: latest ? { ...latest } : null };
+    const deployments = this.deploymentsOf(project.id);
+    const latest = deployments[0];
+    const live = deployments.find((deployment) => deployment.status === "live");
+    return {
+      project: { ...project },
+      latest: latest ? { ...latest } : null,
+      live: live ? { ...live } : null,
+    };
   }
 }

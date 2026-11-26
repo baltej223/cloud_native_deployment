@@ -65,6 +65,7 @@ services:
       APP_CPUS: ${APP_CPUS:-0.5}
       MAX_PROJECTS: ${MAX_PROJECTS:-10}
       DEPLOY_HEALTH_TIMEOUT_SECONDS: ${DEPLOY_HEALTH_TIMEOUT_SECONDS:-120}
+      BUILD_TIMEOUT_SECONDS: ${BUILD_TIMEOUT_SECONDS:-900}
     # Local development only: the container engine socket gives the API full
     # control of the host's containers. On a rootless engine (Podman) the
     # socket belongs to your user, which is root inside the container, so the

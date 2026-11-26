@@ -94,14 +94,78 @@ const imageSourceSchema = z.object({
     ),
 });
 
-/** Phase 1 supports Docker image sources; repository sources arrive in Phase 2. */
-export const projectSourceSchema = z.discriminatedUnion("type", [imageSourceSchema], {
-  errorMap: (issue, context) =>
-    issue.code === "invalid_union_discriminator"
-      ? { message: 'source.type must be "image".' }
-      : { message: context.defaultError },
+/** Public GitHub repositories only: https://github.com/<owner>/<repo>. */
+export const GITHUB_REPO_PATTERN =
+  /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100}?)(?:\.git)?\/?$/;
+
+/** Branch names: git ref characters only, and never an option-like leading "-". */
+export const BRANCH_PATTERN = /^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]{1,100}$/;
+
+/** A relative path inside the repository, without "..". */
+export const REPO_PATH_PATTERN = /^(?!\/)(?!.*(?:^|\/)\.\.(?:\/|$))[A-Za-z0-9._/-]{1,200}$/;
+
+/** The canonical form of a GitHub repository URL, or null if it is not one. */
+export function normalizeRepoUrl(url: string): string | null {
+  const match = GITHUB_REPO_PATTERN.exec(url.trim());
+  if (!match) return null;
+  const repo = match[2]!;
+  if (repo === "." || repo === "..") return null;
+  return `https://github.com/${match[1]}/${repo}`;
+}
+
+/** A project name derived from a repository: https://github.com/a/My_App -> my-app. */
+export function projectNameFromRepo(repoUrl: string): string {
+  const repo = (normalizeRepoUrl(repoUrl) ?? repoUrl).split("/").pop() ?? "";
+  let name = repo
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[^a-z]+/, "")
+    .slice(0, 30)
+    .replace(/-+$/, "");
+  if (name.length < 3) name = `app-${name}`.replace(/-+$/, "").padEnd(3, "0");
+  return name;
+}
+
+const repoSourceSchema = z.object({
+  type: z.literal("repo"),
+  repoUrl: z
+    .string()
+    .trim()
+    .min(1, "source.repoUrl is required.")
+    .refine((url) => normalizeRepoUrl(url) !== null, {
+      message:
+        "source.repoUrl must be a public GitHub repository, e.g. https://github.com/owner/repo.",
+    })
+    .transform((url) => normalizeRepoUrl(url)!),
+  /** Default: the repository's default branch. */
+  branch: z
+    .string()
+    .trim()
+    .regex(BRANCH_PATTERN, "source.branch is not a valid branch name.")
+    .optional(),
+  /** Default: found automatically. */
+  dockerfilePath: z
+    .string()
+    .trim()
+    .regex(REPO_PATH_PATTERN, "source.dockerfilePath must be a path inside the repository.")
+    .optional(),
 });
+
+/** A GitHub repository (the main way to deploy) or a ready-made Docker image. */
+export const projectSourceSchema = z.discriminatedUnion(
+  "type",
+  [repoSourceSchema, imageSourceSchema],
+  {
+    errorMap: (issue, context) =>
+      issue.code === "invalid_union_discriminator"
+        ? { message: 'source.type must be "repo" or "image".' }
+        : { message: context.defaultError },
+  },
+);
 export type ProjectSource = z.infer<typeof projectSourceSchema>;
+export type RepoSource = z.infer<typeof repoSourceSchema>;
+export type ImageSource = z.infer<typeof imageSourceSchema>;
 
 export const envSchema = z
   .record(
@@ -117,30 +181,60 @@ export const envSchema = z
     message: `At most ${MAX_ENV_VARS} environment variables are allowed.`,
   });
 
-export const createProjectRequestSchema = z.object({
-  name: z
-    .string()
-    .trim()
-    .regex(
-      PROJECT_NAME_PATTERN,
-      "name must be 3-30 characters: lowercase letters, digits and hyphens, starting with a letter.",
-    ),
-  source: projectSourceSchema,
-  containerPort: z.coerce
-    .number({ invalid_type_error: "containerPort must be a number." })
-    .int("containerPort must be a whole number.")
-    .min(1, "containerPort must be between 1 and 65535.")
-    .max(65_535, "containerPort must be between 1 and 65535."),
-  healthCheckPath: z
-    .string()
-    .trim()
-    .max(200)
-    .regex(/^\/[A-Za-z0-9._~\-/?=&%]*$/, "healthCheckPath must start with / and be a URL path.")
-    .default("/"),
-  env: envSchema.default({}),
-});
+const portSchema = z.coerce
+  .number({ invalid_type_error: "containerPort must be a number." })
+  .int("containerPort must be a whole number.")
+  .min(1, "containerPort must be between 1 and 65535.")
+  .max(65_535, "containerPort must be between 1 and 65535.");
+
+export const createProjectRequestSchema = z
+  .object({
+    /** Default for repositories: derived from the repository name. */
+    name: z
+      .string()
+      .trim()
+      .regex(
+        PROJECT_NAME_PATTERN,
+        "name must be 3-30 characters: lowercase letters, digits and hyphens, starting with a letter.",
+      )
+      .optional(),
+    source: projectSourceSchema,
+    /** Default for repositories: the EXPOSE port of the Dockerfile. Required for images. */
+    containerPort: portSchema.optional(),
+    healthCheckPath: z
+      .string()
+      .trim()
+      .max(200)
+      .regex(/^\/[A-Za-z0-9._~\-/?=&%]*$/, "healthCheckPath must start with / and be a URL path.")
+      .default("/"),
+    env: envSchema.default({}),
+  })
+  .superRefine((value, context) => {
+    if (value.source.type === "image" && value.containerPort === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["containerPort"],
+        message: "containerPort is required for image deployments.",
+      });
+    }
+    if (value.source.type === "image" && value.name === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["name"],
+        message: "name is required.",
+      });
+    }
+  })
+  .transform((value) => ({
+    ...value,
+    name: value.name ?? projectNameFromRepo((value.source as RepoSource).repoUrl),
+    containerPort: value.containerPort ?? null,
+  }));
 export type CreateProjectRequest = z.input<typeof createProjectRequestSchema>;
 export type CreateProjectInput = z.output<typeof createProjectRequestSchema>;
+
+/** The port the app gets as $PORT, unless the user sets PORT themselves. */
+export const PORT_ENV_VAR = "PORT";
 
 // ---------------------------------------------------------------------------
 // API responses
@@ -150,8 +244,14 @@ export interface DeploymentView {
   id: string;
   projectId: string;
   status: DeploymentStatus;
-  /** Fully qualified image that runs (or ran) for this deployment. */
+  /** Image that runs (or ran): pulled for image sources, built for repositories. */
   imageRef: string | null;
+  /** Repository commit that was built. */
+  commitSha: string | null;
+  /** Dockerfile that was used, relative to the repository root. */
+  dockerfilePath: string | null;
+  /** Port the app listens on in this deployment (given, or detected from EXPOSE). */
+  containerPort: number | null;
   /** Safe, human-readable reason when status is "failed". */
   failureReason: string | null;
   createdAt: string;
@@ -166,13 +266,16 @@ export interface ProjectView {
   id: string;
   name: string;
   source: ProjectSource;
-  containerPort: number;
+  /** Port given by the user; null means "detect from the Dockerfile". */
+  containerPort: number | null;
   healthCheckPath: string;
   env: Record<string, string>;
-  /** Public URL of the app. It works while the latest deployment is live. */
+  /** Public URL of the app. It serves the live deployment, if there is one. */
   url: string;
   status: ProjectStatus;
   latestDeployment: DeploymentView | null;
+  /** The deployment serving the URL. May be older than latestDeployment. */
+  liveDeployment: DeploymentView | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -186,12 +289,26 @@ export interface ListProjectsResponse {
   projects: ProjectView[];
 }
 
+export interface ListDeploymentsResponse {
+  deployments: DeploymentView[];
+}
+
+export interface BuildLogResponse {
+  deploymentId: string;
+  status: DeploymentStatus;
+  /** Build output so far; the start is cut when it exceeds the size limit. */
+  log: string;
+  truncated: boolean;
+}
+
 export const API_ERROR_CODES = [
   "INVALID_INPUT",
   "NAME_TAKEN",
   "PROJECT_LIMIT_REACHED",
   "NO_FREE_PORT",
   "PROJECT_NOT_FOUND",
+  "DEPLOYMENT_NOT_FOUND",
+  "DEPLOYMENT_IN_PROGRESS",
   "NOT_FOUND",
   "INTERNAL_ERROR",
 ] as const;

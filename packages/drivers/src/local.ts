@@ -50,14 +50,16 @@ export class LocalRuntime implements Runtime {
   }
 
   async deploy(spec: AppSpec): Promise<void> {
-    try {
-      await this.engine.pull(spec.image, this.options.pullTimeoutMs ?? 5 * 60_000);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (PULL_NOT_FOUND.test(message)) {
-        throw new DeployError(`Image ${spec.image} was not found, or it is private.`);
+    if (spec.pull) {
+      try {
+        await this.engine.pull(spec.image, this.options.pullTimeoutMs ?? 5 * 60_000);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (PULL_NOT_FOUND.test(message)) {
+          throw new DeployError(`Image ${spec.image} was not found, or it is private.`);
+        }
+        throw new DeployError(`Could not pull image ${spec.image}: ${shorten(message)}`);
       }
-      throw new DeployError(`Could not pull image ${spec.image}: ${shorten(message)}`);
     }
 
     const name = appName(spec.projectId);
@@ -119,6 +121,10 @@ export class LocalRuntime implements Runtime {
 
   remove(projectId: string): Promise<void> {
     return this.engine.removeContainer(appName(projectId));
+  }
+
+  removeImage(image: string): Promise<void> {
+    return this.engine.removeImage(image);
   }
 }
 

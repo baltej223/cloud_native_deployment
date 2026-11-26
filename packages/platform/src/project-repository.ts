@@ -11,7 +11,8 @@ export interface ProjectRecord {
   id: string;
   name: string;
   source: ProjectSource;
-  containerPort: number;
+  /** Given by the user; null means "detect from the Dockerfile". */
+  containerPort: number | null;
   healthCheckPath: string;
   env: Record<string, string>;
   assignedPort: number;
@@ -26,22 +27,30 @@ export interface DeploymentRecord {
   projectId: string;
   status: DeploymentStatus;
   imageRef: string | null;
+  commitSha: string | null;
+  dockerfilePath: string | null;
+  contextPath: string | null;
+  containerPort: number | null;
   failureReason: string | null;
   createdAt: Date;
   updatedAt: Date;
   startedAt: Date | null;
+  /** When the deployment entered "deploying" (after any build). */
+  deployStartedAt: Date | null;
   finishedAt: Date | null;
 }
 
 export interface ProjectWithLatest {
   project: ProjectRecord;
   latest: DeploymentRecord | null;
+  /** The deployment currently serving the project's URL, if any. */
+  live: DeploymentRecord | null;
 }
 
 export interface NewProject {
   name: string;
   source: ProjectSource;
-  containerPort: number;
+  containerPort: number | null;
   healthCheckPath: string;
   env: Record<string, string>;
 }
@@ -53,8 +62,8 @@ export interface ProjectLimits {
 }
 
 export class NameTakenError extends Error {
-  constructor(name: string) {
-    super(`A project named "${name}" already exists.`);
+  constructor(readonly projectName: string) {
+    super(`A project named "${projectName}" already exists.`);
     this.name = "NameTakenError";
   }
 }
@@ -73,9 +82,20 @@ export class NoFreePortError extends Error {
   }
 }
 
+export class DeploymentInProgressError extends Error {
+  constructor() {
+    super("A deployment of this project is already in progress.");
+    this.name = "DeploymentInProgressError";
+  }
+}
+
 export interface TransitionFields {
   imageRef?: string;
   failureReason?: string;
+  commitSha?: string;
+  dockerfilePath?: string;
+  contextPath?: string;
+  containerPort?: number;
 }
 
 /** Work the deployment controller has to do. */
@@ -98,6 +118,18 @@ export interface ProjectRepository {
   get(id: string): Promise<ProjectWithLatest | null>;
   /** Mark a project for deletion. Returns false if it does not exist. */
   markDeleted(id: string): Promise<boolean>;
+  /**
+   * Start a new deployment of an existing project (a redeploy). Returns null
+   * if the project does not exist or is being deleted; throws
+   * DeploymentInProgressError if one is already running.
+   */
+  createDeployment(projectId: string): Promise<DeploymentRecord | null>;
+  /** A project's deployments, newest first. */
+  listDeployments(projectId: string, limit?: number): Promise<DeploymentRecord[]>;
+  getDeployment(id: string): Promise<DeploymentRecord | null>;
+  getBuildLog(id: string): Promise<string | null>;
+  /** Replace the stored build log (the controller writes it as the build runs). */
+  setBuildLog(id: string, log: string): Promise<void>;
   findWork(): Promise<ControllerWork>;
   /**
    * Move a deployment from `from` to `to`, only if it is still in `from`.
@@ -123,7 +155,10 @@ interface ProjectRow {
   name: string;
   source_type: "image" | "repo";
   image: string | null;
-  container_port: number;
+  repo_url: string | null;
+  branch: string | null;
+  dockerfile_path: string | null;
+  container_port: number | null;
   health_check_path: string;
   env: Record<string, string>;
   assigned_port: number;
@@ -133,24 +168,41 @@ interface ProjectRow {
   updated_at: Date;
 }
 
+/** Deployment columns as returned directly, or as JSON (timestamps as strings). */
 interface DeploymentRow {
   id: string;
   project_id: string;
   status: DeploymentStatus;
   image_ref: string | null;
+  commit_sha: string | null;
+  dockerfile_path: string | null;
+  context_path: string | null;
+  container_port: number | null;
   failure_reason: string | null;
-  created_at: Date;
-  updated_at: Date;
-  started_at: Date | null;
-  finished_at: Date | null;
+  created_at: Date | string;
+  updated_at: Date | string;
+  started_at: Date | string | null;
+  deploy_started_at: Date | string | null;
+  finished_at: Date | string | null;
 }
 
+const date = (value: Date | string) => (value instanceof Date ? value : new Date(value));
+const optionalDate = (value: Date | string | null) => (value === null ? null : date(value));
+
 function toProject(row: ProjectRow): ProjectRecord {
+  const source: ProjectSource =
+    row.source_type === "repo"
+      ? {
+          type: "repo",
+          repoUrl: row.repo_url!,
+          ...(row.branch ? { branch: row.branch } : {}),
+          ...(row.dockerfile_path ? { dockerfilePath: row.dockerfile_path } : {}),
+        }
+      : { type: "image", image: row.image! };
   return {
     id: row.id,
     name: row.name,
-    // Only image sources exist so far; repository sources arrive with Phase 2.
-    source: { type: "image", image: row.image ?? "" },
+    source,
     containerPort: row.container_port,
     healthCheckPath: row.health_check_path,
     env: row.env,
@@ -168,47 +220,60 @@ function toDeployment(row: DeploymentRow): DeploymentRecord {
     projectId: row.project_id,
     status: row.status,
     imageRef: row.image_ref,
+    commitSha: row.commit_sha,
+    dockerfilePath: row.dockerfile_path,
+    contextPath: row.context_path,
+    containerPort: row.container_port,
     failureReason: row.failure_reason,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    startedAt: row.started_at,
-    finishedAt: row.finished_at,
+    createdAt: date(row.created_at),
+    updatedAt: date(row.updated_at),
+    startedAt: optionalDate(row.started_at),
+    deployStartedAt: optionalDate(row.deploy_started_at),
+    finishedAt: optionalDate(row.finished_at),
   };
 }
 
-const PROJECT_COLUMNS = `p.id, p.name, p.source_type, p.image, p.container_port, p.health_check_path,
-  p.env, p.assigned_port, p.desired_state, p.deleted_at, p.created_at, p.updated_at`;
-const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.status, d.image_ref, d.failure_reason,
-  d.created_at, d.updated_at, d.started_at, d.finished_at`;
+const PROJECT_COLUMNS = `p.id, p.name, p.source_type, p.image, p.repo_url, p.branch, p.dockerfile_path,
+  p.container_port, p.health_check_path, p.env, p.assigned_port, p.desired_state, p.deleted_at,
+  p.created_at, p.updated_at`;
 
-/** Prefixes deployment columns with `d_` so they can share a row with project columns. */
-const PREFIXED_DEPLOYMENT_COLUMNS = DEPLOYMENT_COLUMNS.split(",")
-  .map((column) => column.trim())
-  .map((column) => `${column} AS d_${column.slice(2)}`)
-  .join(", ");
+/** Everything except the (large) build log. */
+const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.status, d.image_ref, d.commit_sha, d.dockerfile_path,
+  d.context_path, d.container_port, d.failure_reason, d.created_at, d.updated_at, d.started_at,
+  d.deploy_started_at, d.finished_at`;
 
-type JoinedRow = ProjectRow & { [K in keyof DeploymentRow as `d_${K}`]: DeploymentRow[K] | null };
+/** A project with its latest and live deployments as JSON columns. */
+const PROJECT_WITH_DEPLOYMENTS = `SELECT ${PROJECT_COLUMNS},
+    (SELECT row_to_json(x) FROM (
+       SELECT ${DEPLOYMENT_COLUMNS} FROM deployments d
+        WHERE d.project_id = p.id ORDER BY d.created_at DESC LIMIT 1) x) AS latest,
+    (SELECT row_to_json(x) FROM (
+       SELECT ${DEPLOYMENT_COLUMNS} FROM deployments d
+        WHERE d.project_id = p.id AND d.status = 'live' LIMIT 1) x) AS live
+  FROM projects p`;
 
-function splitJoined(row: JoinedRow): ProjectWithLatest {
-  const latest =
-    row.d_id === null
-      ? null
-      : toDeployment({
-          id: row.d_id,
-          project_id: row.d_project_id!,
-          status: row.d_status!,
-          image_ref: row.d_image_ref,
-          failure_reason: row.d_failure_reason,
-          created_at: row.d_created_at!,
-          updated_at: row.d_updated_at!,
-          started_at: row.d_started_at,
-          finished_at: row.d_finished_at,
-        });
-  return { project: toProject(row), latest };
+type ProjectWithDeploymentsRow = ProjectRow & {
+  latest: DeploymentRow | null;
+  live: DeploymentRow | null;
+};
+
+function toProjectWithLatest(row: ProjectWithDeploymentsRow): ProjectWithLatest {
+  return {
+    project: toProject(row),
+    latest: row.latest ? toDeployment(row.latest) : null,
+    live: row.live ? toDeployment(row.live) : null,
+  };
 }
 
 /** Serialises project creation so the project limit and port choice cannot race. */
 const CREATE_LOCK_ID = 7_241_999;
+
+/** Build logs keep their last 256 KB. */
+export const BUILD_LOG_MAX_CHARS = 256 * 1024;
+
+const isUniqueViolation = (error: unknown, constraint: string) =>
+  (error as { code?: string; constraint?: string }).code === "23505" &&
+  (error as { constraint?: string }).constraint === constraint;
 
 export class PostgresProjectRepository implements ProjectRepository {
   constructor(private readonly pool: DatabasePool) {}
@@ -237,18 +302,22 @@ export class PostgresProjectRepository implements ProjectRepository {
       const port = portRows[0]?.port;
       if (port === undefined) throw new NoFreePortError();
 
+      const { source } = input;
       let projectRow: ProjectRow;
       try {
         const { rows } = await client.query<ProjectRow>(
-          `INSERT INTO projects AS p (id, name, source_type, image, container_port,
-             health_check_path, env, assigned_port)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          `INSERT INTO projects AS p (id, name, source_type, image, repo_url, branch,
+             dockerfile_path, container_port, health_check_path, env, assigned_port)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
            RETURNING ${PROJECT_COLUMNS}`,
           [
             randomUUID(),
             input.name,
-            input.source.type,
-            input.source.image,
+            source.type,
+            source.type === "image" ? source.image : null,
+            source.type === "repo" ? source.repoUrl : null,
+            source.type === "repo" ? (source.branch ?? null) : null,
+            source.type === "repo" ? (source.dockerfilePath ?? null) : null,
             input.containerPort,
             input.healthCheckPath,
             JSON.stringify(input.env),
@@ -257,9 +326,7 @@ export class PostgresProjectRepository implements ProjectRepository {
         );
         projectRow = rows[0]!;
       } catch (error) {
-        if ((error as { code?: string; constraint?: string }).constraint === "projects_name_key") {
-          throw new NameTakenError(input.name);
-        }
+        if (isUniqueViolation(error, "projects_name_key")) throw new NameTakenError(input.name);
         throw error;
       }
 
@@ -273,28 +340,18 @@ export class PostgresProjectRepository implements ProjectRepository {
   }
 
   async list(): Promise<ProjectWithLatest[]> {
-    const { rows } = await this.pool.query<JoinedRow>(
-      `SELECT ${PROJECT_COLUMNS}, ${PREFIXED_DEPLOYMENT_COLUMNS}
-         FROM projects p
-         LEFT JOIN LATERAL (
-           SELECT * FROM deployments WHERE project_id = p.id ORDER BY created_at DESC LIMIT 1
-         ) d ON true
-        ORDER BY p.created_at DESC`,
+    const { rows } = await this.pool.query<ProjectWithDeploymentsRow>(
+      `${PROJECT_WITH_DEPLOYMENTS} ORDER BY p.created_at DESC`,
     );
-    return rows.map(splitJoined);
+    return rows.map(toProjectWithLatest);
   }
 
   async get(id: string): Promise<ProjectWithLatest | null> {
-    const { rows } = await this.pool.query<JoinedRow>(
-      `SELECT ${PROJECT_COLUMNS}, ${PREFIXED_DEPLOYMENT_COLUMNS}
-         FROM projects p
-         LEFT JOIN LATERAL (
-           SELECT * FROM deployments WHERE project_id = p.id ORDER BY created_at DESC LIMIT 1
-         ) d ON true
-        WHERE p.id = $1`,
+    const { rows } = await this.pool.query<ProjectWithDeploymentsRow>(
+      `${PROJECT_WITH_DEPLOYMENTS} WHERE p.id = $1`,
       [id],
     );
-    return rows[0] ? splitJoined(rows[0]) : null;
+    return rows[0] ? toProjectWithLatest(rows[0]) : null;
   }
 
   async markDeleted(id: string): Promise<boolean> {
@@ -306,23 +363,76 @@ export class PostgresProjectRepository implements ProjectRepository {
     return rowCount === 1;
   }
 
+  async createDeployment(projectId: string): Promise<DeploymentRecord | null> {
+    try {
+      const { rows } = await this.pool.query<DeploymentRow>(
+        `INSERT INTO deployments AS d (id, project_id)
+         SELECT $1, id FROM projects WHERE id = $2 AND deleted_at IS NULL
+         RETURNING ${DEPLOYMENT_COLUMNS}`,
+        [randomUUID(), projectId],
+      );
+      return rows[0] ? toDeployment(rows[0]) : null;
+    } catch (error) {
+      if (isUniqueViolation(error, "deployments_one_active_per_project")) {
+        throw new DeploymentInProgressError();
+      }
+      throw error;
+    }
+  }
+
+  async listDeployments(projectId: string, limit = 20): Promise<DeploymentRecord[]> {
+    const { rows } = await this.pool.query<DeploymentRow>(
+      `SELECT ${DEPLOYMENT_COLUMNS} FROM deployments d
+        WHERE d.project_id = $1 ORDER BY d.created_at DESC LIMIT $2`,
+      [projectId, limit],
+    );
+    return rows.map(toDeployment);
+  }
+
+  async getDeployment(id: string): Promise<DeploymentRecord | null> {
+    const { rows } = await this.pool.query<DeploymentRow>(
+      `SELECT ${DEPLOYMENT_COLUMNS} FROM deployments d WHERE d.id = $1`,
+      [id],
+    );
+    return rows[0] ? toDeployment(rows[0]) : null;
+  }
+
+  async getBuildLog(id: string): Promise<string | null> {
+    const { rows } = await this.pool.query<{ build_log: string }>(
+      "SELECT build_log FROM deployments WHERE id = $1",
+      [id],
+    );
+    return rows[0]?.build_log ?? null;
+  }
+
+  async setBuildLog(id: string, log: string): Promise<void> {
+    await this.pool.query("UPDATE deployments SET build_log = $2 WHERE id = $1", [
+      id,
+      log.length > BUILD_LOG_MAX_CHARS ? log.slice(-BUILD_LOG_MAX_CHARS) : log,
+    ]);
+  }
+
   async findWork(): Promise<ControllerWork> {
     const [active, deleting] = await Promise.all([
-      this.pool.query<JoinedRow>(
-        `SELECT ${PROJECT_COLUMNS}, ${PREFIXED_DEPLOYMENT_COLUMNS}
-           FROM deployments d JOIN projects p ON p.id = d.project_id
-          WHERE d.status IN ('pending', 'building', 'deploying') AND p.deleted_at IS NULL
-          ORDER BY d.created_at`,
+      this.pool.query<ProjectRow & { deployment: DeploymentRow }>(
+        `SELECT ${PROJECT_COLUMNS}, row_to_json(x) AS deployment
+           FROM projects p
+           JOIN LATERAL (
+             SELECT ${DEPLOYMENT_COLUMNS} FROM deployments d
+              WHERE d.project_id = p.id AND d.status IN ('pending', 'building', 'deploying')
+           ) x ON true
+          WHERE p.deleted_at IS NULL
+          ORDER BY x.created_at`,
       ),
       this.pool.query<ProjectRow>(
         `SELECT ${PROJECT_COLUMNS} FROM projects p WHERE p.deleted_at IS NOT NULL`,
       ),
     ]);
     return {
-      deployments: active.rows.map((row) => {
-        const { project, latest } = splitJoined(row);
-        return { project, deployment: latest! };
-      }),
+      deployments: active.rows.map((row) => ({
+        project: toProject(row),
+        deployment: toDeployment(row.deployment),
+      })),
       deletions: deleting.rows.map(toProject),
     };
   }
@@ -342,19 +452,33 @@ export class PostgresProjectRepository implements ProjectRepository {
         if (to === "live") {
           await client.query(
             `UPDATE deployments SET status = 'superseded'
-            WHERE status = 'live'
-              AND project_id = (SELECT project_id FROM deployments WHERE id = $1)`,
+              WHERE status = 'live' AND id <> $1
+                AND project_id = (SELECT project_id FROM deployments WHERE id = $1)`,
             [id],
           );
         }
         const { rows } = await client.query<DeploymentRow>(
           `UPDATE deployments AS d
-            SET status = $3,
-                image_ref = coalesce($4, image_ref),
-                failure_reason = coalesce($5, failure_reason)
-          WHERE id = $1 AND status = $2
-          RETURNING ${DEPLOYMENT_COLUMNS}`,
-          [id, from, to, fields.imageRef ?? null, fields.failureReason ?? null],
+              SET status = $3,
+                  image_ref = coalesce($4, image_ref),
+                  failure_reason = coalesce($5, failure_reason),
+                  commit_sha = coalesce($6, commit_sha),
+                  dockerfile_path = coalesce($7, dockerfile_path),
+                  context_path = coalesce($8, context_path),
+                  container_port = coalesce($9, container_port)
+            WHERE id = $1 AND status = $2
+            RETURNING ${DEPLOYMENT_COLUMNS}`,
+          [
+            id,
+            from,
+            to,
+            fields.imageRef ?? null,
+            fields.failureReason ?? null,
+            fields.commitSha ?? null,
+            fields.dockerfilePath ?? null,
+            fields.contextPath ?? null,
+            fields.containerPort ?? null,
+          ],
         );
         // Roll back the supersede above if this deployment had already moved on.
         if (!rows[0]) throw notInState;

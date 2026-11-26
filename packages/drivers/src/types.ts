@@ -14,6 +14,8 @@ export interface AppSpec {
   env: Record<string, string>;
   /** Port on which the platform exposes the app to users. */
   publicPort: number;
+  /** Pull the image first (registry images); false for images built here. */
+  pull: boolean;
 }
 
 export type AppState =
@@ -43,6 +45,8 @@ export interface Runtime {
   inspect(projectId: string): Promise<AppState>;
   /** Remove the project's app. Succeeds if it is already gone. */
   remove(projectId: string): Promise<void>;
+  /** Delete an image built for the project. Succeeds if it is already gone. */
+  removeImage(image: string): Promise<void>;
 }
 
 export interface AppTarget {
@@ -57,6 +61,39 @@ export interface Router {
   urlFor(project: { name: string; publicPort: number }): string;
   /** True if the app answers HTTP requests (any status below 500). */
   probe(target: AppTarget): Promise<boolean>;
+}
+
+export interface BuildRequest {
+  projectId: string;
+  deploymentId: string;
+  /** Canonical https://github.com/<owner>/<repo> URL. */
+  repoUrl: string;
+  /** Default: the repository's default branch. */
+  branch?: string;
+  /** Default: discovered. */
+  dockerfilePath?: string;
+  /** Aborts the build (project deleted, timeout, shutdown). */
+  signal: AbortSignal;
+  /** Receives build output as it happens. */
+  onLog: (text: string) => void;
+}
+
+export interface BuildResult {
+  /** Image reference the runtime can start without pulling. */
+  image: string;
+  commitSha: string;
+  /** Dockerfile used, relative to the repository root. */
+  dockerfilePath: string;
+  /** Build context, relative to the repository root ("." for the root). */
+  contextPath: string;
+  /** First port of the final stage's EXPOSE, if any. */
+  exposedPort: number | null;
+}
+
+/** Turns a repository into a runnable image. */
+export interface Builder {
+  /** Throws DeployError with a user-facing reason when the build fails. */
+  build(request: BuildRequest): Promise<BuildResult>;
 }
 
 /** A deployment step failed for a reason that is safe to show to the user. */

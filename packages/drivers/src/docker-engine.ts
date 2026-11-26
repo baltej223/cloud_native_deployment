@@ -1,4 +1,5 @@
 import { request } from "node:http";
+import type { Readable } from "node:stream";
 
 /**
  * Minimal client for the Docker Engine API over a Unix socket. Podman serves
@@ -9,7 +10,7 @@ export class DockerEngine {
   /** Docker-compatible API version; supported by Docker 20.10+ and Podman 4+. */
   private readonly prefix = "/v1.41";
 
-  constructor(private readonly socketPath: string) {}
+  constructor(readonly socketPath: string) {}
 
   async ping(): Promise<void> {
     const response = await this.call("GET", "/_ping");
@@ -73,6 +74,92 @@ export class DockerEngine {
       `/containers/${encodeURIComponent(name)}?force=true&v=true`,
     );
     if (response.status !== 204 && response.status !== 404) {
+      throw new EngineError(response.status, response.body);
+    }
+  }
+
+  /**
+   * Build an image from a tar stream of the build context. Output lines
+   * (`stream`) go to `onOutput`; a build error is thrown as an EngineError.
+   */
+  async build(
+    context: Readable,
+    options: { tag: string; dockerfile: string; signal: AbortSignal },
+    onOutput: (text: string) => void,
+  ): Promise<void> {
+    const query = new URLSearchParams({
+      t: options.tag,
+      dockerfile: options.dockerfile,
+      rm: "1",
+      forcerm: "1",
+    });
+    await new Promise<void>((resolve, reject) => {
+      let failure: string | undefined;
+      let pending = "";
+      let status = 0;
+      let body = "";
+
+      const handleLine = (line: string) => {
+        if (!line.trim()) return;
+        let message: {
+          stream?: string;
+          status?: string;
+          error?: string;
+          errorDetail?: { message?: string };
+          message?: string;
+        };
+        try {
+          message = JSON.parse(line);
+        } catch {
+          onOutput(`${line}\n`);
+          return;
+        }
+        if (message.stream) onOutput(message.stream);
+        else if (message.status) onOutput(`${message.status}\n`);
+        const error = message.errorDetail?.message ?? message.error;
+        if (error) failure = error;
+      };
+
+      const req = request(
+        {
+          socketPath: this.socketPath,
+          method: "POST",
+          path: `${this.prefix}/build?${query}`,
+          headers: { Host: "docker", "Content-Type": "application/x-tar" },
+          signal: options.signal,
+        },
+        (res) => {
+          status = res.statusCode ?? 0;
+          res.setEncoding("utf8");
+          res.on("data", (chunk: string) => {
+            if (status !== 200) {
+              body += chunk;
+              return;
+            }
+            pending += chunk;
+            const lines = pending.split(/\r?\n/);
+            pending = lines.pop() ?? "";
+            lines.forEach(handleLine);
+          });
+          res.on("end", () => {
+            if (status !== 200) return reject(new EngineError(status, body));
+            handleLine(pending);
+            if (failure) reject(new EngineError(500, JSON.stringify({ message: failure })));
+            else resolve();
+          });
+          res.on("error", reject);
+        },
+      );
+      req.on("error", reject);
+      context.on("error", (error) => req.destroy(error));
+      context.pipe(req);
+    });
+  }
+
+  /** Remove an image. Succeeds if it does not exist or is still in use. */
+  async removeImage(name: string): Promise<void> {
+    const response = await this.call("DELETE", `/images/${encodeURIComponent(name)}`);
+    if (![200, 404, 409].includes(response.status)) {
       throw new EngineError(response.status, response.body);
     }
   }

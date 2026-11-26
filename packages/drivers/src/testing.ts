@@ -1,5 +1,8 @@
 import {
   appName,
+  type BuildRequest,
+  type BuildResult,
+  type Builder,
   DeployError,
   type AppSpec,
   type AppState,
@@ -49,6 +52,12 @@ export class FakeRuntime implements Runtime {
     return this.apps.get(projectId)?.state ?? { state: "missing" };
   }
 
+  readonly removedImages: string[] = [];
+
+  async removeImage(image: string): Promise<void> {
+    this.removedImages.push(image);
+  }
+
   async remove(projectId: string): Promise<void> {
     this.removed.push(projectId);
     this.apps.delete(projectId);
@@ -65,6 +74,46 @@ export class FakeRouter implements Router {
 
   async probe(target: AppTarget): Promise<boolean> {
     return !this.unhealthy.has(target.projectId);
+  }
+}
+
+/** Scriptable Builder for controller tests. Builds finish when `finish` is called. */
+export class FakeBuilder implements Builder {
+  readonly requests: BuildRequest[] = [];
+  /** Port the fake Dockerfile exposes. */
+  exposedPort: number | null = 3000;
+  /** When set, builds fail with this reason. */
+  failWith: string | null = null;
+  /** Builds wait until released, so tests can observe the "building" state. */
+  autoFinish = true;
+  private readonly waiting = new Map<string, () => void>();
+
+  async build(request: BuildRequest): Promise<BuildResult> {
+    this.requests.push(request);
+    request.onLog("==> Cloning\n");
+    if (!this.autoFinish) {
+      await new Promise<void>((resolve, reject) => {
+        this.waiting.set(request.deploymentId, resolve);
+        request.signal.addEventListener("abort", () => reject(new Error("aborted")), {
+          once: true,
+        });
+      });
+    }
+    if (this.failWith) throw new DeployError(this.failWith);
+    request.onLog("==> Built\n");
+    return {
+      image: `localhost/${appName(request.projectId)}:${request.deploymentId.slice(0, 12)}`,
+      commitSha: "0123456789abcdef0123456789abcdef01234567",
+      dockerfilePath: request.dockerfilePath ?? "Dockerfile",
+      contextPath: ".",
+      exposedPort: this.exposedPort,
+    };
+  }
+
+  /** Let a waiting build complete. */
+  finish(deploymentId: string): void {
+    this.waiting.get(deploymentId)?.();
+    this.waiting.delete(deploymentId);
   }
 }
 

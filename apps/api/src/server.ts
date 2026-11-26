@@ -1,4 +1,4 @@
-import { LocalRouter, LocalRuntime } from "@cloud-platform/drivers";
+import { LocalBuilder, LocalRouter, LocalRuntime } from "@cloud-platform/drivers";
 import {
   createLogger,
   createPool,
@@ -23,6 +23,10 @@ const runtime = new LocalRuntime({
   network: config.APP_NETWORK || undefined,
   memoryMb: config.APP_MEMORY_MB,
   cpus: config.APP_CPUS,
+});
+const builder = new LocalBuilder({
+  socketPath: config.DOCKER_SOCKET,
+  workDir: config.BUILD_WORK_DIR,
 });
 const router = new LocalRouter({
   publicHost: config.APP_PUBLIC_HOST,
@@ -55,8 +59,9 @@ const app = createApp({
   readinessChecks,
 });
 
-const controller = new DeploymentController(repository, runtime, router, logger, {
+const controller = new DeploymentController(repository, builder, runtime, router, logger, {
   intervalMs: config.CONTROLLER_INTERVAL_MS,
+  buildTimeoutMs: config.BUILD_TIMEOUT_SECONDS * 1000,
   healthTimeoutMs: config.DEPLOY_HEALTH_TIMEOUT_SECONDS * 1000,
   deployTimeoutMs: config.DEPLOY_TIMEOUT_SECONDS * 1000,
 });
