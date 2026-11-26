@@ -14,11 +14,11 @@ Hosted platforms such as Vercel, Render and Heroku solve this by hiding the infr
 
 ## 2. Our Solution: What is our approach?
 
-We are building a mini Platform-as-a-Service (PaaS) on AWS. A user gives the platform **a public GitHub repository (with a Dockerfile) or a Docker image**, and the platform builds it, runs it as a container, routes traffic to it and returns a **public URL**. The platform itself is also deployed automatically from its own repository.
+We are building a mini Platform-as-a-Service (PaaS) on AWS. A user gives the platform **a public GitHub repository URL**. The platform clones it, **finds the Dockerfile itself**, builds the image, runs it as a container, routes traffic to it and returns a **public URL**. Deploying a ready-made Docker image is also possible, as a secondary, advanced option. The platform itself is also deployed automatically from its own repository.
 
 **Key Pillars of the Solution:**
 
-* **One-step deployment for users:** Submit a repository or image and a port. The platform handles cloning, building, pushing, running, routing and health checking, and reports progress until the app is live.
+* **One-step deployment for users:** Paste a repository URL. The platform finds the Dockerfile, works out the port, and handles cloning, building, pushing, running, routing and health checking, reporting progress until the app is live. Users never have to describe their container by hand.
 
 * **The platform deploys itself (CI/CD):** Every push to the platform's own repository runs checks, builds images and rolls out the new version, with no manual steps.
 
@@ -52,7 +52,11 @@ The implementation uses AWS managed services, Docker, Next.js and Node.js.
 
 **Part 1: Deploying a user's app**
 
-1. **Submit:** The user opens the platform dashboard and creates a project, giving either a public GitHub repository URL (with branch and Dockerfile path) or a Docker image reference, plus the port the app listens on and optional environment variables.
+1. **Submit:** The user opens the platform dashboard and pastes a public GitHub repository URL. Branch, Dockerfile path, port and environment variables are optional overrides. (Advanced: a Docker image reference instead of a repository.)
+
+   **Dockerfile discovery:** the platform clones the repository (shallow) and looks for a `Dockerfile` (or `Containerfile`) at the root. If there is none, it searches subdirectories up to three levels deep, skipping folders such as `node_modules`, `.git`, `vendor` and test fixtures. Exactly one match is used, with its directory as the build context. If several match, the root one wins; otherwise the deployment fails and lists the candidates so the user can pick one. A repository with no Dockerfile fails with a clear message.
+
+   **Port detection:** the platform reads the `EXPOSE` instruction of the Dockerfile's final stage. If there is none, it uses the port the user gave, or fails asking for one. The chosen port is also passed to the app as the `PORT` environment variable, which many frameworks read.
 
 2. **Record the deployment:** The API validates the request, saves the project and a new deployment in PostgreSQL with status `pending`, and responds right away. PostgreSQL holds the desired state; it is the source of truth.
 

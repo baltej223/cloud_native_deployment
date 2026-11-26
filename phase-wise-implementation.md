@@ -64,7 +64,7 @@ See [Phase 1: Build the platform locally](phase-1-application-building.md) for t
 
 ### Goal
 
-Support repository sources, and make the deployment lifecycle and API contract explicit and durable.
+Make **a GitHub repository the main way to deploy**: the user pastes a URL, and the platform finds the Dockerfile, builds it and runs it. Also make the deployment lifecycle and API contract explicit and durable.
 
 ### Data model
 
@@ -72,14 +72,15 @@ Support repository sources, and make the deployment lifecycle and API contract e
 
 - `id` (UUID), `name` (unique, lowercase DNS label, 3-30 characters)
 - `source_type`: `image` or `repo`
-- `image` (for image sources); `repo_url`, `branch` (default `main`), `dockerfile_path` (default `Dockerfile`), `context_path` (default `.`) for repository sources
-- `container_port`, `health_check_path` (default `/`), `env` (JSONB)
+- `image` (for image sources); `repo_url`, `branch` (default: the repository's default branch), optional `dockerfile_path` override for repository sources
+- `container_port` (optional for repositories: detected from `EXPOSE`), `health_check_path` (default `/`), `env` (JSONB)
 - `assigned_port` (unique; local host port or ALB listener port), `desired_state`: `running` or `stopped`
 - `created_at`, `updated_at`, `last_activity_at`
 
 `deployments`:
 
 - `id` (UUID), `project_id`, `status`, `image_ref` (set once built or resolved)
+- `dockerfile_path` and `context_path` actually used (as discovered), `commit_sha`
 - `build_id`, `failure_reason` (safe summary), `created_at`, `updated_at`, `started_at`, `finished_at`
 
 Deployment states: `pending` → `building` (repository only) → `deploying` → `live`, or `failed` from any non-final state; a live deployment becomes `superseded` when a newer one goes live, and `cancelled` if the project is deleted first. A database trigger rejects any other transition.
@@ -97,16 +98,20 @@ Deployment states: `pending` → `building` (repository only) → `deploying` �
 
 ### Work
 
-- Implement the local `Builder`: clone the repository at the branch (shallow) into a temporary directory, build with the given Dockerfile and context, tag the image with the deployment ID, and save the build output as logs.
+- Make the repository form the default in the dashboard: a single "GitHub repository" field, with branch, Dockerfile path, port and env vars under "Advanced". The image form moves to a secondary tab.
+- Implement the local `Builder`: clone the repository at the branch (shallow) into a temporary directory, record the commit, **discover the Dockerfile** (root first, then up to three levels deep, skipping `node_modules`, `.git`, `vendor` and test folders; a single match wins, several matches fail with the list of candidates), **detect the port** from the final stage's `EXPOSE`, build with the discovered Dockerfile and its directory as context, tag the image with the deployment ID, and save the build output as logs.
+- Pass the port to the app as `PORT`, so apps that read it listen where the platform expects.
 - Validate repository URLs (public `https://github.com/<owner>/<repo>` only) and image references.
 
 ### Deliverable
 
-A documented API and migrations. Deploying a public repository with a Dockerfile, for example a small Node.js or Python web app, produces a live URL locally.
+A documented API and migrations. Pasting only the URL of a public repository with a Dockerfile, for example a small Node.js or Python web app, produces a live URL locally, with no other input.
 
 ### Completion checks
 
 - Invalid input returns `400` with field errors and creates nothing.
+- A repository whose Dockerfile sits in a subfolder deploys without the user naming it.
+- A repository with several candidate Dockerfiles fails with the list; choosing one deploys it.
 - A repository without a Dockerfile, or with a failing build, ends `failed` with the build log available.
 - Status can be read at every stage.
 - API errors never expose stack traces, credentials or internal hostnames.
