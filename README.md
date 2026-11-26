@@ -42,10 +42,26 @@ There is no queue: the database records what should exist, and the controller ma
 
 Requirements: Docker Engine or Docker Desktop, with Compose and buildx.
 
+### Start and stop
+
 ```bash
-cp .env.example .env          # optional; every value has a default
-docker compose up --build
+cp .env.example .env              # once; optional, every value has a default
+
+docker compose up -d --build      # start (or update after code changes) in the background
+docker compose ps                 # check: api and postgres "healthy", web "Up"
+docker compose logs -f api        # follow the API and controller logs (Ctrl+C to leave)
+
+docker compose stop               # stop the platform; start again with: docker compose start
+docker compose down               # stop and remove the platform's containers (keeps the database)
 ```
+
+`.env` with `USE_SUPABASE=yes` uses the hosted database. To start with the local one regardless:
+
+```bash
+USE_SUPABASE= DATABASE_URL= DATABASE_PASSWORD= DATABASE_SSL=disable docker compose up -d --build
+```
+
+Stopping the platform does not stop deployed apps: they are separate containers. Delete projects in the dashboard first, or remove them as shown under [Clean up](#clean-up).
 
 Open http://localhost:3000, paste a repository URL, and press **Deploy**. Follow the build log on the project page; when it shows **Live**, open its URL.
 
@@ -62,11 +78,10 @@ Things to try (all tested):
 
 On the **Docker image** tab, `nginx:alpine` with port 80 goes live without a build.
 
-### Stop and clean up
+### Clean up
 
 ```bash
-docker compose down               # stop the platform (keeps the database)
-docker compose down -v            # also delete the database volume
+docker compose down -v            # stop the platform and delete its database volume
 docker rm -f $(docker ps -aq --filter label=cloud-platform.project)   # remove app containers
 docker volume rm $(docker volume ls -q --filter label=cloud-platform.project)   # compose volumes
 docker network rm cloud-platform-apps $(docker network ls -q --filter label=cloud-platform.project)
