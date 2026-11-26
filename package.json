@@ -1,0 +1,32 @@
+{
+  "name": "cloud-platform",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/contracts",
+    "packages/platform",
+    "packages/drivers",
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "build:packages": "npm run build -w @cloud-platform/contracts -w @cloud-platform/platform -w @cloud-platform/drivers",
+    "build": "npm run build:packages && npm run build -w @cloud-platform/api -w @cloud-platform/web",
+    "typecheck": "npm run build:packages && npm run typecheck --workspaces --if-present",
+    "test": "npm run build:packages && npm run test --workspaces --if-present",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "migrate": "npm run migrate -w @cloud-platform/platform",
+    "dev:api": "npm run dev -w @cloud-platform/api",
+    "dev:web": "npm run dev -w @cloud-platform/web"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "prettier": "^3.5.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

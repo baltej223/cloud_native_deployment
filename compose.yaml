@@ -1,0 +1,114 @@
+# Local platform: docker compose up --build
+# Values come from .env when present (copy .env.example), otherwise the defaults below.
+#
+# The API starts user apps as sibling containers through the host's Docker or
+# Podman socket (HOST_CONTAINER_SOCKET). Those containers publish their ports
+# on the host (APP_PORT_RANGE), so app URLs look like http://localhost:8001.
+
+name: cloud-platform
+
+x-database-env: &database-env
+  NODE_ENV: ${NODE_ENV:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # Defaults to the local postgres container. Set DATABASE_URL (without a password)
+  # and DATABASE_PASSWORD in .env to use a hosted database such as Supabase.
+  DATABASE_URL: ${DATABASE_URL:-postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@postgres:5432/${POSTGRES_DB:-cloud_platform}}
+  DATABASE_PASSWORD: ${DATABASE_PASSWORD:-}
+  DATABASE_SSL: ${DATABASE_SSL:-disable}
+  DATABASE_SSL_CA_FILE: ${DATABASE_SSL_CA_FILE:-}
+  DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-10}
+  USE_SUPABASE: ${USE_SUPABASE:-}
+
+services:
+  postgres:
+    image: docker.io/library/postgres:17-alpine
+    # Local database. Skipped when USE_SUPABASE=yes: the profile name is then
+    # non-empty and never activated. Empty or unset USE_SUPABASE means an empty
+    # profile, which Compose treats as "always start".
+    profiles: ["${USE_SUPABASE:+skip-local-postgres}"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-cloud_platform}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: { context: ., target: migrate }
+    environment: *database-env
+    depends_on:
+      # Not required: with USE_SUPABASE=yes there is no local postgres to wait for.
+      postgres: { condition: service_healthy, required: false }
+    restart: "no"
+
+  api:
+    build: { context: ., target: api }
+    environment:
+      <<: *database-env
+      API_PORT: 3001
+      WEB_ORIGIN: ${WEB_ORIGIN:-http://localhost:3000}
+      PLATFORM_DRIVER: local
+      DOCKER_SOCKET: /var/run/docker.sock
+      APP_NETWORK: cloud-platform-apps
+      APP_PORT_RANGE: ${APP_PORT_RANGE:-8001-8050}
+      APP_PUBLIC_HOST: ${APP_PUBLIC_HOST:-localhost}
+      # The API joins the apps network and checks apps by container name.
+      APP_PROBE_VIA: network
+      APP_MEMORY_MB: ${APP_MEMORY_MB:-512}
+      APP_CPUS: ${APP_CPUS:-0.5}
+      MAX_PROJECTS: ${MAX_PROJECTS:-10}
+      DEPLOY_HEALTH_TIMEOUT_SECONDS: ${DEPLOY_HEALTH_TIMEOUT_SECONDS:-120}
+    # Local development only: the container engine socket gives the API full
+    # control of the host's containers. On a rootless engine (Podman) the
+    # socket belongs to your user, which is root inside the container, so the
+    # API runs as root here; SELinux labelling is disabled so it may open the
+    # socket. The production image runs as an unprivileged user.
+    user: "0"
+    security_opt: ["label=disable"]
+    volumes:
+      - ${HOST_CONTAINER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+    ports:
+      - "${API_PORT:-3001}:3001"
+    networks: [default, apps]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://localhost:3001/health/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      target: web
+      args:
+        # Inlined into the browser bundle, so it must be reachable from the host browser.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:3001}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+networks:
+  # User apps live here, away from the database on the default network.
+  apps:
+    name: cloud-platform-apps
+
+volumes:
+  postgres-data:

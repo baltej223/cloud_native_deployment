@@ -1,0 +1,36 @@
+{
+  "name": "@cloud-platform/platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
+  },
+  "bin": {
+    "cloud-platform-migrate": "./dist/migrate-cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migrate": "node --env-file-if-exists=../../.env.host dist/migrate-cli.js",
+    "test": "node --test \"dist/**/*.test.js\""
+  },
+  "dependencies": {
+    "@cloud-platform/contracts": "0.1.0",
+    "pg": "^8.13.0",
+    "pino": "^9.6.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.11.0"
+  }
+}
