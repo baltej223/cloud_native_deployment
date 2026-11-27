@@ -1,7 +1,7 @@
 #!/bin/bash
 # Starts the platform on the EC2 instance (run by cloud-platform.service on boot).
 # The domain and admin password come from SSM Parameter Store; Caddy serves
-# https://$DOMAIN and app URLs are http://$DOMAIN:8001-8050.
+# https://$DOMAIN and apps on https://<project>.$DOMAIN.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
@@ -35,6 +35,8 @@ SESSION_SECRET=$(cat "$secret_file")
 export SESSION_SECRET
 export SECURE_COOKIES=true
 export APP_PUBLIC_HOST="$DOMAIN"
+# Apps get https://<project>.$DOMAIN (DNS: a wildcard record *.$DOMAIN).
+export APP_DOMAIN="$DOMAIN"
 export WEB_ORIGIN="https://$DOMAIN"
 export NEXT_PUBLIC_API_BASE_URL=/api
 export NODE_ENV=production

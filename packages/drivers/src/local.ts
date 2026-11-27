@@ -174,7 +174,9 @@ export class LocalRuntime implements Runtime {
         },
         NetworkingConfig: { EndpointsConfig: { [network]: { Aliases: [service.name] } } },
       });
-      if (isPublic && this.options.network) {
+      // The public service, and services that publish ports (they get their own
+      // URL through the proxy), also join the shared apps network.
+      if ((isPublic || service.httpPort) && this.options.network) {
         await this.engine.connectNetwork(this.options.network, name, []);
       }
       await this.engine.startContainer(name);
@@ -284,13 +286,23 @@ export interface LocalRouterOptions {
   probeVia: "network" | "host";
   probeHost?: string;
   probeTimeoutMs?: number;
+  /**
+   * With a domain, apps get https://<project>.<appDomain> and compose services
+   * https://<service>.<project>.<appDomain> (a reverse proxy routes them).
+   * Without one, http://<publicHost>:<port>.
+   */
+  appDomain?: string;
 }
 
 /** Apps are reached on their published host port. */
 export class LocalRouter implements Router {
   constructor(private readonly options: LocalRouterOptions) {}
 
-  urlFor(project: { name: string; publicPort: number }): string {
+  urlFor(project: { name: string; publicPort: number }, service?: string): string {
+    const domain = this.options.appDomain;
+    if (domain) {
+      return `https://${service ? `${service.toLowerCase()}.` : ""}${project.name}.${domain}`;
+    }
     return `http://${this.options.publicHost}:${project.publicPort}`;
   }
 

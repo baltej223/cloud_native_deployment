@@ -32,6 +32,7 @@ const router = new LocalRouter({
   publicHost: config.APP_PUBLIC_HOST,
   probeVia: config.APP_PROBE_VIA,
   probeHost: config.APP_PROBE_HOST,
+  appDomain: config.APP_DOMAIN || undefined,
 });
 
 const readinessChecks = {
@@ -58,6 +59,7 @@ const app = createApp({
   logger,
   allowedOrigins: config.WEB_ORIGIN,
   readinessChecks,
+  routing: config.APP_DOMAIN ? { repository, domain: config.APP_DOMAIN } : undefined,
   auth: {
     password: config.ADMIN_PASSWORD,
     secret: config.SESSION_SECRET,

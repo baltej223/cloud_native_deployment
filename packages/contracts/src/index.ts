@@ -304,6 +304,8 @@ export interface ServiceSpec {
   /** Docker restart policy name. */
   restart: "no" | "always" | "unless-stopped" | "on-failure";
   dependsOn: string[];
+  /** Port of a service that publishes ports (`ports:`): it gets its own URL. */
+  httpPort?: number | null;
 }
 
 /** What a compose file deploys: its services and the one that gets the URL. */
@@ -362,6 +364,8 @@ export interface ProjectView {
   env: Record<string, string>;
   /** Public URL of the app. It serves the live deployment, if there is one. */
   url: string;
+  /** URLs of the other compose services that publish ports, by service name. */
+  serviceUrls: Record<string, string>;
   status: ProjectStatus;
   /** Whether the app should run. The controller makes the containers match. */
   desiredState: DesiredState;

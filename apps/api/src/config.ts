@@ -59,6 +59,8 @@ export const loadConfig = () =>
     /** Stop apps that had no network traffic for this long; 0 turns auto-stop off. */
     AUTO_STOP_IDLE_MINUTES: z.coerce.number().int().min(0).default(120),
 
+    /** With a domain, apps get https://<project>.<APP_DOMAIN> through the proxy. */
+    APP_DOMAIN: z.string().default(""),
     /** Admin password for the dashboard; empty turns login off (local development). */
     ADMIN_PASSWORD: z.string().default(""),
     /** Signs session cookies; random per start when empty (sessions end on restart). */

@@ -27,6 +27,7 @@ import {
 } from "@cloud-platform/platform";
 import type { ZodIssue } from "zod";
 import { HttpError } from "./errors.js";
+import { routedServices } from "./routes.js";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -120,6 +121,15 @@ export class ProjectsService {
       healthCheckPath: project.healthCheckPath,
       env: project.env,
       url: this.router.urlFor({ name: project.name, publicPort: project.assignedPort }),
+      serviceUrls: Object.fromEntries(
+        routedServices({ project, latest, live }).map((service) => [
+          service.name,
+          this.router.urlFor(
+            { name: project.name, publicPort: project.assignedPort },
+            service.name,
+          ),
+        ]),
+      ),
       status: project.deletedAt
         ? "deleting"
         : project.desiredState === "stopped" && !(latest && isActiveDeployment(latest.status))

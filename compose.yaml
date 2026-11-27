@@ -61,6 +61,8 @@ services:
       APP_NETWORK: cloud-platform-apps
       APP_PORT_RANGE: ${APP_PORT_RANGE:-8001-8050}
       APP_PUBLIC_HOST: ${APP_PUBLIC_HOST:-localhost}
+      # Set on a server with the proxy: apps get https://<project>.$APP_DOMAIN.
+      APP_DOMAIN: ${APP_DOMAIN:-}
       # The API joins the apps network and checks apps by container name.
       APP_PROBE_VIA: network
       APP_MEMORY_MB: ${APP_MEMORY_MB:-512}

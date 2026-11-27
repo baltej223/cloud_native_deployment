@@ -5,6 +5,8 @@ import cors from "cors";
 import express, { type ErrorRequestHandler, type RequestHandler } from "express";
 import { type AuthOptions, createAuth } from "./auth.js";
 import { HttpError } from "./errors.js";
+import { createRoutes } from "./routes.js";
+import type { ProjectRepository } from "@cloud-platform/platform";
 import type { ProjectsService } from "./projects-service.js";
 
 export interface AppDependencies {
@@ -15,6 +17,8 @@ export interface AppDependencies {
   readinessChecks: Record<string, () => Promise<void>>;
   /** Admin login; omitted or without a password, every request is allowed. */
   auth?: AuthOptions;
+  /** Host-name routing for the reverse proxy, when apps get subdomains. */
+  routing?: { repository: ProjectRepository; domain: string };
 }
 
 const READINESS_TIMEOUT_MS = 2_000;
@@ -32,6 +36,7 @@ export function createApp({
   allowedOrigins,
   readinessChecks,
   auth = { password: "", secureCookie: false },
+  routing,
 }: AppDependencies) {
   const app = express();
   app.disable("x-powered-by");
@@ -62,6 +67,8 @@ export function createApp({
   app.use(requestLogger);
   app.use(cors({ origin: allowedOrigins, credentials: true }));
   app.use(express.json({ limit: "100kb" }));
+  // Asked by the proxy, not the browser: before the login check.
+  if (routing) app.use(createRoutes(routing.repository, routing.domain));
   app.use(authRouter);
   app.use(guard);
 

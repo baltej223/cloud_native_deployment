@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >-
   Cloud platform on one EC2 instance. Docker runs the platform (Compose) and the
-  user apps; app URLs are http://<public-ip>:8001-8050. Sized for the AWS free tier.
+  user apps; apps get https://<project>.<Domain> (add a wildcard DNS record). Sized for the AWS free tier.
 
 Parameters:
   Domain:
@@ -46,14 +46,7 @@ Resources:
             FromPort: 443,
             ToPort: 443,
             CidrIp: 0.0.0.0/0,
-            Description: Dashboard and API over HTTPS,
-          }
-        - {
-            IpProtocol: tcp,
-            FromPort: 8001,
-            ToPort: 8050,
-            CidrIp: 0.0.0.0/0,
-            Description: User apps,
+            Description: Dashboard API and apps over HTTPS,
           }
       Tags: [{ Key: Name, Value: cloud-platform }]
 

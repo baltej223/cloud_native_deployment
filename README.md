@@ -112,7 +112,9 @@ With `USE_SUPABASE=yes`, Compose does not start the local postgres container. Us
 `deploy/aws/platform.yaml` is a CloudFormation stack sized for the free tier: one
 Ubuntu instance (t3.micro, 20 GiB gp3, 2 GiB swap) with an Elastic IP, running
 Docker, this Compose stack and Caddy. The dashboard is at `https://<your domain>`
-behind a password; apps get `http://<your domain>:8001-8050`. There is no SSH;
+behind a password. Apps get `https://<project>.<your domain>`, and every other
+compose service that publishes ports gets `https://<service>.<project>.<your domain>`.
+There is no SSH;
 use Session Manager.
 
 1. Store the admin password (type it yourself; it never goes in the repository):
@@ -122,8 +124,9 @@ use Session Manager.
      --type SecureString --overwrite --value "$PW"; unset PW
    ```
 
-2. Create or update the stack, then point your domain's DNS **A record** at the
-   `ElasticIp` output. Caddy gets the HTTPS certificate once DNS resolves.
+2. Create or update the stack, then point two DNS **A records** at the `ElasticIp`
+   output: your domain, and the wildcard `*.<your domain>` for the apps. Caddy gets
+   each certificate when a name is first visited (only for names of deployed apps).
 
    ```bash
    aws cloudformation deploy --stack-name cloud-platform \

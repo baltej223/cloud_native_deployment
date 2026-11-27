@@ -26,7 +26,7 @@ export interface ServiceBuild {
   target: string | null;
 }
 
-export interface ParsedService extends Omit<ServiceSpec, "image" | "pull"> {
+export interface ParsedService extends Omit<ServiceSpec, "image" | "pull" | "httpPort"> {
   /** Registry image, fully qualified; null when the service is built. */
   image: string | null;
   build: ServiceBuild | null;

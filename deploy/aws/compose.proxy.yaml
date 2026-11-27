@@ -1,5 +1,6 @@
 # Added on the EC2 server: docker compose -f compose.yaml -f deploy/aws/compose.proxy.yaml
-# Caddy serves the dashboard and API over HTTPS on $DOMAIN (see Caddyfile).
+# Caddy serves the dashboard and API over HTTPS on $DOMAIN, and apps on its
+# subdomains (see Caddyfile). It joins the apps network to reach them.
 services:
   caddy:
     image: docker.io/library/caddy:2.10.0-alpine
@@ -12,6 +13,7 @@ services:
       - ./deploy/aws/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy-data:/data
       - caddy-config:/config
+    networks: [default, apps]
     depends_on: [api, web]
     restart: unless-stopped
 

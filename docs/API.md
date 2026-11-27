@@ -74,6 +74,7 @@ Response:
     "healthCheckPath": "/",
     "env": {},
     "url": "http://localhost:8001",
+    "serviceUrls": {},
     "status": "pending",
     "latestDeployment": { "...": "same as deployment below" },
     "liveDeployment": null,
@@ -161,6 +162,16 @@ The last lines the running app wrote to stdout and stderr, with timestamps.
 ### `DELETE /projects/:id`
 
 Returns `202 { "id": "…", "status": "deleting" }`. The controller stops any build, removes the app and its built images, then the project record; after that, `GET /projects/:id` returns `404` and the name and port can be reused.
+
+## App URLs
+
+Locally an app's `url` is `http://localhost:<port>`. With `APP_DOMAIN` set (the EC2
+server), it is `https://<project>.<APP_DOMAIN>`, and `serviceUrls` lists the other
+compose services that publish ports: `{ "result": "https://result.<project>.<APP_DOMAIN>" }`.
+Caddy routes those names: it asks `GET /routes/check?domain=` before getting a
+certificate, and `GET /routes/resolve` (with the request's host) for each request;
+the answer names the container, or is `404` (unknown name) or `503` (app stopped).
+These two endpoints need no login and are not reachable through the dashboard's `/api`.
 
 ## Login
 

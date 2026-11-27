@@ -176,6 +176,18 @@ export default function ProjectPage() {
               ) : (
                 <p className="big-url muted">{project.url}</p>
               )}
+              {Object.entries(project.serviceUrls ?? {}).map(([service, url]) => (
+                <p key={service} className="service-url">
+                  <span className="muted">{service}</span>{" "}
+                  {live && !stopped ? (
+                    <a href={url} target="_blank" rel="noreferrer" className="url">
+                      {url} ↗
+                    </a>
+                  ) : (
+                    <span className="muted mono">{url}</span>
+                  )}
+                </p>
+              ))}
               {latest?.status === "building" && (
                 <p className="muted">Building the image from the repository…</p>
               )}

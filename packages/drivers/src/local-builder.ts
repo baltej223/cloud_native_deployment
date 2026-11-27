@@ -249,7 +249,8 @@ export class LocalBuilder implements Builder {
     let exposedPort = publicService.port;
     const services: ServiceSpec[] = [];
     for (const service of parsed.services) {
-      const { build, publishes: _publishes, port: _port, image: pulled, copies, ...rest } = service;
+      const { build, publishes, port, image: pulled, copies, ...fields } = service;
+      const rest = { ...fields, httpPort: publishes ? port : null };
       const image = `localhost/${appName(request.projectId)}-${service.name.toLowerCase()}:${request.deploymentId.slice(0, 12)}`;
       if (!build) {
         onLog(`==> Service ${service.name} uses image ${pulled}\n`);

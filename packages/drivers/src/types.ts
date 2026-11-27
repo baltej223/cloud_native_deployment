@@ -87,7 +87,8 @@ export interface AppTarget {
 
 /** Gives apps a URL and checks that they answer on it. */
 export interface Router {
-  urlFor(project: { name: string; publicPort: number }): string;
+  /** The app's URL, or with `service` the URL of one of its compose services. */
+  urlFor(project: { name: string; publicPort: number }, service?: string): string;
   /** True if the app answers HTTP requests (any status below 500). */
   probe(target: AppTarget): Promise<boolean>;
 }

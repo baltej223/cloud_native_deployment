@@ -114,8 +114,10 @@ export class FakeRuntime implements Runtime {
 export class FakeRouter implements Router {
   readonly unhealthy = new Set<string>();
 
-  urlFor(project: { name: string; publicPort: number }): string {
-    return `http://apps.test:${project.publicPort}`;
+  urlFor(project: { name: string; publicPort: number }, service?: string): string {
+    return service
+      ? `http://${service}.${project.name}.apps.test`
+      : `http://apps.test:${project.publicPort}`;
   }
 
   async probe(target: AppTarget): Promise<boolean> {

@@ -1,11 +1,42 @@
-# HTTPS for the dashboard on EC2. Caddy gets the certificate from Let's Encrypt.
-# /api/* goes to the API (prefix removed); everything else to the dashboard.
+# HTTPS on the EC2 server. Caddy gets certificates from Let's Encrypt.
+{
+	# App certificates are issued when a name is first visited, only for names
+	# the API knows (a deployed project or a compose service with ports).
+	on_demand_tls {
+		ask http://api:3001/routes/check
+	}
+}
+
+# Dashboard: /api/* goes to the API (prefix removed), the rest to the web app.
 {$DOMAIN} {
 	encode gzip
+	handle /api/routes/* {
+		respond 404
+	}
 	handle_path /api/* {
 		reverse_proxy api:3001
 	}
 	handle {
 		reverse_proxy web:3000
 	}
+}
+
+# Apps: <project>.{$DOMAIN} and <service>.<project>.{$DOMAIN}. The API says which
+# container serves the name (or answers 404/503 itself).
+https:// {
+	tls {
+		on_demand
+	}
+	route {
+		request_header -X-Cp-Upstream
+		forward_auth api:3001 {
+			uri /routes/resolve
+			copy_headers X-Cp-Upstream
+		}
+		reverse_proxy {http.request.header.X-Cp-Upstream}
+	}
+}
+
+http:// {
+	redir https://{host}{uri} permanent
 }
