@@ -142,12 +142,51 @@ limited to 256 MB, 5 projects and 30 minutes idle time.
 
 Locally, login is off unless `ADMIN_PASSWORD` is set.
 
-Remove everything, including user apps (they run on the instance):
+### Pause and resume (save money)
+
+Stopping the instance keeps everything (projects, database, certificate, the Elastic
+IP and DNS). While stopped you pay only for the 20 GiB disk and the idle Elastic IP,
+roughly US$5 a month at list prices, less within the free tier.
+
+```bash
+ID=$(aws cloudformation describe-stacks --stack-name cloud-platform \
+  --query "Stacks[0].Outputs[?OutputKey=='InstanceId'].OutputValue" --output text)
+
+aws ec2 stop-instances --instance-ids "$ID"     # pause
+aws ec2 start-instances --instance-ids "$ID"    # resume: the platform is back in 1-3 minutes
+aws ec2 describe-instances --instance-ids "$ID" \
+  --query "Reservations[0].Instances[0].State.Name" --output text
+```
+
+Remove everything, including user apps (they run on the instance). This costs
+nothing afterwards, but the data is gone; recreating gives a new Elastic IP, so
+update the DNS record:
 
 ```bash
 aws cloudformation delete-stack --stack-name cloud-platform
 aws ssm delete-parameter --name /cloud-platform/admin-password
 ```
+
+## CI/CD
+
+`.github/workflows/ci.yml` runs on every push and pull request: format check,
+typecheck, unit and database tests (against a PostgreSQL service) and build. A push
+to `main` that passes is deployed: GitHub Actions signs in to AWS through OIDC (no
+stored keys) with a role that may only run commands on the platform instance
+(`deploy/aws/github-deploy.yaml`, stack `cloud-platform-ci`). The instance checks
+out that commit and restarts the platform, then the workflow waits for
+`/api/health/ready`. Deploys take about 5 minutes and run one at a time; the
+dashboard is briefly unavailable while the platform restarts.
+
+- **Roll back:** re-run the deploy job of an older run in the Actions tab, or push a revert.
+- **Instance stopped:** the deploy job fails with "No running platform instance";
+  start it and re-run the job.
+- **Set up the role** (once per account):
+
+  ```bash
+  aws cloudformation deploy --stack-name cloud-platform-ci \
+    --template-file deploy/aws/github-deploy.yaml --capabilities CAPABILITY_NAMED_IAM
+  ```
 
 ## Development
 

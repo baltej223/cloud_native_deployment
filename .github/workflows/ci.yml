@@ -1,0 +1,96 @@
+# Checks every push and pull request. A push to main that passes is deployed to
+# the EC2 server: GitHub signs in to AWS with OIDC (deploy/aws/github-deploy.yaml)
+# and the instance checks out this commit and restarts the platform.
+# Roll back by re-running the deploy job of an older run.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-1
+  DEPLOY_ROLE_ARN: arn:aws:iam::410707111137:role/cloud-platform-github-deploy
+  STACK_NAME: cloud-platform
+  PUBLIC_URL: https://cloud.baltej.me
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: cloud_platform_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app" --health-interval 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+        env:
+          TEST_DATABASE_URL: postgres://app:app@localhost:5432/cloud_platform_test
+      - run: npm run build
+
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    # One deploy at a time; a newer push waits rather than cancelling a rollout.
+    concurrency: { group: deploy-production, cancel-in-progress: false }
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy ${{ github.sha }}
+        run: |
+          instance=$(aws ec2 describe-instances \
+            --filters "Name=tag:aws:cloudformation:stack-name,Values=$STACK_NAME" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].InstanceId" --output text)
+          if [ -z "$instance" ] || [ "$instance" = "None" ]; then
+            echo "::error::No running platform instance (is it stopped?)"; exit 1
+          fi
+          script="set -e; cd /opt/cloud-platform; git fetch --quiet origin $GITHUB_SHA; git reset --hard $GITHUB_SHA; systemctl restart cloud-platform; git log -1 --oneline"
+          command=$(aws ssm send-command --instance-ids "$instance" \
+            --document-name AWS-RunShellScript --timeout-seconds 600 \
+            --comment "deploy ${GITHUB_SHA::12}" \
+            --parameters "{\"commands\":[\"$script\"],\"executionTimeout\":[\"2400\"]}" \
+            --query Command.CommandId --output text)
+          echo "Command $command on $instance"
+          for _ in $(seq 1 160); do
+            status=$(aws ssm get-command-invocation --command-id "$command" \
+              --instance-id "$instance" --query Status --output text 2>/dev/null || echo Pending)
+            case "$status" in Success|Failed|Cancelled|TimedOut) break ;; esac
+            sleep 15
+          done
+          aws ssm get-command-invocation --command-id "$command" --instance-id "$instance" \
+            --query "[StandardOutputContent,StandardErrorContent]" --output text | tail -40
+          [ "$status" = Success ] || { echo "::error::Deploy finished with $status"; exit 1; }
+
+      - name: Check the platform answers
+        run: |
+          for _ in $(seq 1 30); do
+            if curl -sf "$PUBLIC_URL/api/health/ready"; then echo; exit 0; fi
+            sleep 5
+          done
+          echo "::error::$PUBLIC_URL/api/health/ready did not answer"; exit 1

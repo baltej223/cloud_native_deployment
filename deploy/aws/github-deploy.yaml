@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Lets GitHub Actions on the main branch deploy the cloud platform: it may only
+  run commands on the platform's EC2 instance through Systems Manager. No stored keys.
+
+Parameters:
+  GitHubRepository:
+    Type: String
+    Default: baltej223/cloud_native_deployment
+  GitHubRepositoryWithIds:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional owner@id/repo@id form (e.g. octo@123/app@456) that newer repositories
+      send in the OIDC subject.
+    AllowedPattern: "^$|^[A-Za-z0-9_.-]+@[0-9]+/[A-Za-z0-9_.-]+@[0-9]+$"
+  GitHubBranch:
+    Type: String
+    Default: main
+  CreateOidcProvider:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: false when the account already has the GitHub OIDC provider from another stack.
+
+Conditions:
+  CreateProvider: !Equals [!Ref CreateOidcProvider, "true"]
+  HasRepositoryIds: !Not [!Equals [!Ref GitHubRepositoryWithIds, ""]]
+
+Resources:
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: cloud-platform-github-deploy
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub:
+                  - !Sub repo:${GitHubRepository}:ref:refs/heads/${GitHubBranch}
+                  - !If
+                    - HasRepositoryIds
+                    - !Sub repo:${GitHubRepositoryWithIds}:ref:refs/heads/${GitHubBranch}
+                    - !Ref AWS::NoValue
+      Policies:
+        - PolicyName: run-deploy-command
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: FindTheInstance
+                Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: "*"
+              - Sid: RunShellScriptOnPlatformInstanceOnly
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    ssm:resourceTag/aws:cloudformation:stack-name: cloud-platform
+              - Sid: WithTheShellScriptDocument
+                Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+              - Sid: ReadCommandResults
+                Effect: Allow
+                Action: [ssm:GetCommandInvocation, ssm:ListCommandInvocations]
+                Resource: "*"
+
+Outputs:
+  DeployRoleArn:
+    Value: !GetAtt GitHubDeployRole.Arn

@@ -178,31 +178,24 @@ The CodeBuild, ECR, ECS and load balancer design is dropped: it does not fit a f
 
 ---
 
-## Phase 5: Infrastructure as code and CI/CD for the platform
+## Phase 5: CI/CD for the platform (done)
 
 ### Goal
 
-Make the environment reproducible and deploy platform changes through a controlled pipeline.
+Deploy platform changes through a controlled pipeline, with no stored AWS keys.
 
 ### Work
 
-- Define all platform resources in CloudFormation: networking, security groups, ECR repositories, ECS cluster and services, ALB, CodeBuild project, log groups, IAM roles, SSM references, alarms and dashboard. Per-app resources are created by the controller at runtime, not by the stack; tag them so they can be found and cleaned up.
-- Keep environment-specific values as parameters: region, allowed IP range, port range, project limit, task sizes, idle timeout, optional domain.
-- Use GitHub Actions to run checks, build and push versioned images, run migrations as a one-off ECS task and update the stack.
-- Authenticate GitHub Actions to AWS through OIDC with narrowly scoped roles; no stored AWS keys.
-- Keep build and deploy permissions separate from the permissions of running tasks.
-- Provide a teardown script that deletes all per-app resources before deleting the stack.
-
-### Deliverable
-
-Infrastructure code and a GitHub Actions workflow that deploy a reviewed change to staging from the repository, and a documented, complete teardown.
+- `.github/workflows/ci.yml`: format check, typecheck, unit and database tests (PostgreSQL service container) and build on every push and pull request.
+- On a passing push to `main`, deploy: GitHub signs in through OIDC to `cloud-platform-github-deploy` (`deploy/aws/github-deploy.yaml`), which may only send `AWS-RunShellScript` to instances of the `cloud-platform` stack. The instance checks out the commit and restarts the platform; the job then waits for `/api/health/ready`.
+- One deploy at a time; roll back by re-running an older run's deploy job.
+- Pause, resume and teardown commands are in the README.
 
 ### Completion checks
 
-- A clean account can be brought up from the templates and docs alone.
-- A push to `main` runs checks, pushes images and rolls out the new version.
-- Deployments use versioned images and can be rolled back.
-- Teardown leaves no billable resources, including user apps.
+- A push to `main` runs the checks and rolls out the new version.
+- A failing check blocks the deploy.
+- No AWS keys are stored in GitHub; the deploy role cannot do anything but run commands on the platform instance.
 - Secrets do not appear in the repository, images or workflow logs.
 
 ---
