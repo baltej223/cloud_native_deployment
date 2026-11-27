@@ -119,6 +119,8 @@ A documented API and migrations. Pasting only the URL of a public repository wit
 
 ## Phase 3: Make the controller reliable and add app management
 
+**Status: done.** Compose apps; PATCH settings; rollback; stop/start with self-healing; runtime logs; auto-stop after `AUTO_STOP_IDLE_MINUTES` of no network traffic; controller advisory lock. See docs/API.md.
+
 ### Goal
 
 Make the deployment controller safe to restart and run in parallel, and add the day-to-day operations users need.

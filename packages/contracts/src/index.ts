@@ -127,6 +127,19 @@ export function projectNameFromRepo(repoUrl: string): string {
   return name;
 }
 
+const branchSchema = z
+  .string()
+  .trim()
+  .regex(BRANCH_PATTERN, "source.branch is not a valid branch name.");
+const dockerfilePathSchema = z
+  .string()
+  .trim()
+  .regex(REPO_PATH_PATTERN, "source.dockerfilePath must be a path inside the repository.");
+const composeServiceSchema = z
+  .string()
+  .trim()
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$/, "source.composeService is not a valid service name.");
+
 const repoSourceSchema = z.object({
   type: z.literal("repo"),
   repoUrl: z
@@ -139,30 +152,14 @@ const repoSourceSchema = z.object({
     })
     .transform((url) => normalizeRepoUrl(url)!),
   /** Default: the repository's default branch. */
-  branch: z
-    .string()
-    .trim()
-    .regex(BRANCH_PATTERN, "source.branch is not a valid branch name.")
-    .optional(),
-  /** Default: found automatically. */
-  dockerfilePath: z
-    .string()
-    .trim()
-    .regex(REPO_PATH_PATTERN, "source.dockerfilePath must be a path inside the repository.")
-    .optional(),
+  branch: branchSchema.optional(),
+  /** Default: found automatically. Setting it skips the compose file. */
+  dockerfilePath: dockerfilePathSchema.optional(),
   /**
    * Compose apps: the service that gets the URL. Default: the one that
-   * publishes a port. A compose file at the root is used unless
-   * dockerfilePath is set.
+   * publishes a port.
    */
-  composeService: z
-    .string()
-    .trim()
-    .regex(
-      /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$/,
-      "source.composeService is not a valid service name.",
-    )
-    .optional(),
+  composeService: composeServiceSchema.optional(),
 });
 
 /** A GitHub repository (the main way to deploy) or a ready-made Docker image. */
@@ -200,6 +197,12 @@ const portSchema = z.coerce
   .min(1, "containerPort must be between 1 and 65535.")
   .max(65_535, "containerPort must be between 1 and 65535.");
 
+const healthCheckPathSchema = z
+  .string()
+  .trim()
+  .max(200)
+  .regex(/^\/[A-Za-z0-9._~\-/?=&%]*$/, "healthCheckPath must start with / and be a URL path.");
+
 export const createProjectRequestSchema = z
   .object({
     /** Default for repositories: derived from the repository name. */
@@ -214,12 +217,7 @@ export const createProjectRequestSchema = z
     source: projectSourceSchema,
     /** Default for repositories: the EXPOSE port of the Dockerfile. Required for images. */
     containerPort: portSchema.optional(),
-    healthCheckPath: z
-      .string()
-      .trim()
-      .max(200)
-      .regex(/^\/[A-Za-z0-9._~\-/?=&%]*$/, "healthCheckPath must start with / and be a URL path.")
-      .default("/"),
+    healthCheckPath: healthCheckPathSchema.default("/"),
     env: envSchema.default({}),
   })
   .superRefine((value, context) => {
@@ -245,6 +243,33 @@ export const createProjectRequestSchema = z
   }));
 export type CreateProjectRequest = z.input<typeof createProjectRequestSchema>;
 export type CreateProjectInput = z.output<typeof createProjectRequestSchema>;
+
+/**
+ * Change a project's settings. Every field is optional; null clears a
+ * repository setting back to "automatic". Changes apply to the next
+ * deployment (redeploy, rollback or start after a crash).
+ */
+export const updateProjectRequestSchema = z
+  .object({
+    containerPort: portSchema.nullable().optional(),
+    healthCheckPath: healthCheckPathSchema.optional(),
+    env: envSchema.optional(),
+    branch: branchSchema.nullable().optional(),
+    dockerfilePath: dockerfilePathSchema.nullable().optional(),
+    composeService: composeServiceSchema.nullable().optional(),
+  })
+  .strict()
+  .refine((value) => Object.keys(value).length > 0, {
+    message:
+      "Nothing to change: set containerPort, healthCheckPath, env, branch, dockerfilePath or composeService.",
+  });
+export type UpdateProjectRequest = z.input<typeof updateProjectRequestSchema>;
+export type UpdateProjectInput = z.output<typeof updateProjectRequestSchema>;
+
+export const rollbackRequestSchema = z.object({
+  deploymentId: z.string().uuid("deploymentId must be a deployment ID."),
+});
+export type RollbackRequest = z.input<typeof rollbackRequestSchema>;
 
 /** The port the app gets as $PORT, unless the user sets PORT themselves. */
 export const PORT_ENV_VAR = "PORT";
@@ -308,6 +333,8 @@ export interface DeploymentView {
   compose: { file: string; publicService: string; services: string[] } | null;
   /** Port the app listens on in this deployment (given, or detected from EXPOSE). */
   containerPort: number | null;
+  /** Set when this deployment rolls back to an earlier one (no build). */
+  rollbackOf: string | null;
   /** Safe, human-readable reason when status is "failed". */
   failureReason: string | null;
   createdAt: string;
@@ -315,8 +342,15 @@ export interface DeploymentView {
   finishedAt: string | null;
 }
 
-/** What the dashboard shows for a project: its latest deployment, or deletion. */
-export type ProjectStatus = DeploymentStatus | "deleting";
+/**
+ * What the dashboard shows for a project: its latest deployment's status,
+ * "stopped" when stopped by the user or for being idle, or "deleting".
+ */
+export type ProjectStatus = DeploymentStatus | "stopped" | "deleting";
+
+export type DesiredState = "running" | "stopped";
+/** Why a project is stopped: by its user, or automatically after being idle. */
+export type StopReason = "user" | "idle";
 
 export interface ProjectView {
   id: string;
@@ -329,6 +363,11 @@ export interface ProjectView {
   /** Public URL of the app. It serves the live deployment, if there is one. */
   url: string;
   status: ProjectStatus;
+  /** Whether the app should run. The controller makes the containers match. */
+  desiredState: DesiredState;
+  stopReason: StopReason | null;
+  /** Last time the app had network traffic (or was started). */
+  lastActiveAt: string;
   latestDeployment: DeploymentView | null;
   /** The deployment serving the URL. May be older than latestDeployment. */
   liveDeployment: DeploymentView | null;
@@ -357,6 +396,16 @@ export interface BuildLogResponse {
   truncated: boolean;
 }
 
+export interface RuntimeLogResponse {
+  projectId: string;
+  /** Compose service the log is from; null for single-container apps. */
+  service: string | null;
+  /** All services of a compose app, for picking another log. */
+  services: string[];
+  /** The last lines the app wrote to stdout and stderr, with timestamps. */
+  log: string;
+}
+
 export const API_ERROR_CODES = [
   "INVALID_INPUT",
   "NAME_TAKEN",
@@ -365,6 +414,8 @@ export const API_ERROR_CODES = [
   "PROJECT_NOT_FOUND",
   "DEPLOYMENT_NOT_FOUND",
   "DEPLOYMENT_IN_PROGRESS",
+  "NO_LIVE_DEPLOYMENT",
+  "ROLLBACK_NOT_POSSIBLE",
   "NOT_FOUND",
   "INTERNAL_ERROR",
 ] as const;

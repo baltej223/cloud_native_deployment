@@ -58,6 +58,47 @@ export class DockerEngine {
     }
   }
 
+  /** Stop a container (SIGTERM, then SIGKILL after `seconds`). Succeeds if it is stopped or gone. */
+  async stopContainer(name: string, seconds = 10): Promise<void> {
+    const response = await this.call(
+      "POST",
+      `/containers/${encodeURIComponent(name)}/stop?t=${seconds}`,
+      undefined,
+      (seconds + 20) * 1000,
+    );
+    if (![204, 304, 404].includes(response.status)) {
+      throw new EngineError(response.status, response.body);
+    }
+  }
+
+  /** The last `tail` lines of a container's stdout and stderr, or null if it does not exist. */
+  async containerLogs(name: string, tail: number): Promise<string | null> {
+    const response = await this.callRaw(
+      "GET",
+      `/containers/${encodeURIComponent(name)}/logs?stdout=true&stderr=true&timestamps=true&tail=${tail}`,
+    );
+    if (response.status === 404) return null;
+    if (response.status !== 200) {
+      throw new EngineError(response.status, response.body.toString("utf8"));
+    }
+    return demultiplex(response.body);
+  }
+
+  /** Total bytes received on all networks, or null if the container is not running. */
+  async receivedBytes(name: string): Promise<number | null> {
+    const response = await this.call(
+      "GET",
+      `/containers/${encodeURIComponent(name)}/stats?stream=false&one-shot=true`,
+    );
+    if (response.status === 404) return null;
+    if (response.status !== 200) throw new EngineError(response.status, response.body);
+    const stats = JSON.parse(response.body) as {
+      networks?: Record<string, { rx_bytes: number }>;
+    };
+    if (!stats.networks) return null;
+    return Object.values(stats.networks).reduce((sum, network) => sum + network.rx_bytes, 0);
+  }
+
   /** Container details, or null if there is no such container. */
   async inspectContainer(name: string): Promise<ContainerInspect | null> {
     const response = await this.call("GET", `/containers/${encodeURIComponent(name)}/json`);
@@ -156,12 +197,22 @@ export class DockerEngine {
     }
   }
 
-  private call(
+  private async call(
     method: string,
     path: string,
     body?: unknown,
     timeoutMs = 30_000,
   ): Promise<{ status: number; body: string }> {
+    const response = await this.callRaw(method, path, body, timeoutMs);
+    return { status: response.status, body: response.body.toString("utf8") };
+  }
+
+  private callRaw(
+    method: string,
+    path: string,
+    body?: unknown,
+    timeoutMs = 30_000,
+  ): Promise<{ status: number; body: Buffer }> {
     const payload = body === undefined ? undefined : JSON.stringify(body);
     return new Promise((resolve, reject) => {
       const req = request(
@@ -181,7 +232,7 @@ export class DockerEngine {
           const chunks: Buffer[] = [];
           res.on("data", (chunk: Buffer) => chunks.push(chunk));
           res.on("end", () =>
-            resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks).toString("utf8") }),
+            resolve({ status: res.statusCode ?? 0, body: Buffer.concat(chunks) }),
           );
           res.on("error", reject);
         },
@@ -194,6 +245,27 @@ export class DockerEngine {
       req.end();
     });
   }
+}
+
+/**
+ * Container logs without a TTY come as frames: an 8-byte header (stream type,
+ * three zero bytes, big-endian length) followed by the payload.
+ */
+export function demultiplex(buffer: Buffer): string {
+  const parts: Buffer[] = [];
+  let offset = 0;
+  while (
+    offset + 8 <= buffer.length &&
+    buffer[offset]! <= 2 &&
+    buffer.readUIntBE(offset + 1, 3) === 0
+  ) {
+    const length = buffer.readUInt32BE(offset + 4);
+    parts.push(buffer.subarray(offset + 8, offset + 8 + length));
+    offset += 8 + length;
+  }
+  // Not framed (a container with a TTY): the body is the plain log.
+  if (offset === 0) return buffer.toString("utf8");
+  return Buffer.concat(parts).toString("utf8");
 }
 
 export interface ContainerInspect {

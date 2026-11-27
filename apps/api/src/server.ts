@@ -51,6 +51,7 @@ const app = createApp({
   projects: new ProjectsService(
     repository,
     router,
+    runtime,
     { portRange: config.APP_PORT_RANGE, maxProjects: config.MAX_PROJECTS },
     logger,
   ),
@@ -64,6 +65,7 @@ const controller = new DeploymentController(repository, builder, runtime, router
   buildTimeoutMs: config.BUILD_TIMEOUT_SECONDS * 1000,
   healthTimeoutMs: config.DEPLOY_HEALTH_TIMEOUT_SECONDS * 1000,
   deployTimeoutMs: config.DEPLOY_TIMEOUT_SECONDS * 1000,
+  idleTimeoutMs: config.AUTO_STOP_IDLE_MINUTES * 60_000,
 });
 controller.start();
 

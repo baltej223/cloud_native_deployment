@@ -65,6 +65,45 @@ export class FakeRuntime implements Runtime {
   }
 
   readonly removedData: string[] = [];
+  readonly stopped: string[] = [];
+  readonly started: AppSpec[] = [];
+  /** Bytes "received" per project; tests change it to simulate traffic. */
+  readonly traffic = new Map<string, number>();
+  /** Log text per project and service ("" = the public one). */
+  readonly logLines = new Map<string, string>();
+
+  async stop(projectId: string): Promise<void> {
+    this.stopped.push(projectId);
+    const app = this.apps.get(projectId);
+    if (app && app.state.state !== "missing") {
+      app.state = { ...app.state, state: "exited", exitCode: 0 };
+    }
+  }
+
+  async start(spec: AppSpec): Promise<void> {
+    this.started.push(spec);
+    const app = this.apps.get(spec.projectId);
+    if (!app || app.state.state === "missing" || app.state.deploymentId !== spec.deploymentId) {
+      return this.deploy(spec);
+    }
+    app.state = {
+      ...app.state,
+      state: "running",
+      exitCode: null,
+      startedAt: new Date(this.clock()),
+    };
+  }
+
+  async logs(projectId: string, service: string | null): Promise<string | null> {
+    if (!this.apps.has(projectId)) return null;
+    return this.logLines.get(`${projectId}/${service ?? ""}`) ?? null;
+  }
+
+  async receivedBytes(projectId: string): Promise<number | null> {
+    const app = this.apps.get(projectId);
+    if (!app || app.state.state !== "running") return null;
+    return this.traffic.get(projectId) ?? 0;
+  }
 
   async removeData(projectId: string): Promise<void> {
     this.removedData.push(projectId);

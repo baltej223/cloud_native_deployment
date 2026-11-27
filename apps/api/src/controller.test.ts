@@ -365,3 +365,72 @@ test("a compose app runs all its services and keeps the plan with the deployment
   assert.deepEqual(runtime.removedImages, [web.image]);
   assert.deepEqual(runtime.removedData, [project.id]);
 });
+
+// ---------------------------------------------------------------------------
+// Keeping live apps in their desired state
+// ---------------------------------------------------------------------------
+
+test("a live app whose container disappeared is started again", async () => {
+  const { project } = await createProject();
+  await ticks(3);
+  assert.equal(await statusOf(project.id), "live");
+  runtime.apps.delete(project.id); // removed by hand
+  await ticks(1);
+  assert.equal((await runtime.inspect(project.id)).state, "running");
+  assert.equal(runtime.started.length, 1);
+  assert.equal(runtime.started[0]!.pull, false, "no pull when starting the live version");
+});
+
+test("an idle app is stopped, and traffic keeps it running", async () => {
+  controller = new DeploymentController(repository, builder, runtime, router, logger, {
+    intervalMs: 1_000,
+    buildTimeoutMs: 60_000,
+    healthTimeoutMs: HEALTH_TIMEOUT,
+    deployTimeoutMs: DEPLOY_TIMEOUT,
+    idleTimeoutMs: 10 * 60_000,
+    activityIntervalMs: 60_000,
+    now: () => clock,
+  });
+  const { project } = await createProject();
+  await ticks(3); // live; first traffic sample taken
+
+  // Traffic every few minutes keeps it running.
+  for (let minute = 1; minute <= 15; minute++) {
+    clock += 60_000;
+    if (minute % 5 === 0) runtime.traffic.set(project.id, minute * 1_000);
+    await ticks(1);
+  }
+  assert.equal((await repository.get(project.id))!.project.desiredState, "running");
+
+  // Ten quiet minutes stop it.
+  for (let minute = 1; minute <= 11; minute++) {
+    clock += 60_000;
+    await ticks(1);
+  }
+  const { project: stopped } = (await repository.get(project.id))!;
+  assert.equal(stopped.desiredState, "stopped");
+  assert.equal(stopped.stopReason, "idle");
+  assert.deepEqual(runtime.stopped, [project.id]);
+});
+
+test("only the instance holding the lock acts; another takes over when it stops", async () => {
+  const other = Object.create(repository) as InMemoryProjectRepository; // same data, other "connection"
+  const second = new DeploymentController(other, builder, runtime, router, logger, {
+    intervalMs: 1_000,
+    buildTimeoutMs: 60_000,
+    healthTimeoutMs: HEALTH_TIMEOUT,
+    deployTimeoutMs: DEPLOY_TIMEOUT,
+    now: () => clock,
+  });
+  await controller.tick(); // takes the lock
+  const { project } = await createProject();
+  await second.tick();
+  await second.tick();
+  assert.equal(await statusOf(project.id), "pending", "the second instance does nothing");
+
+  await controller.stop(); // releases the lock
+  await second.tick();
+  await second.tick();
+  assert.equal(runtime.deployed.length, 1);
+  assert.equal(await statusOf(project.id), "deploying");
+});

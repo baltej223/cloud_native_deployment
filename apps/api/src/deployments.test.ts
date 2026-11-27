@@ -7,7 +7,7 @@ import type {
   DeploymentView,
   ListDeploymentsResponse,
 } from "@cloud-platform/contracts";
-import { FakeRouter } from "@cloud-platform/drivers/testing";
+import { FakeRouter, FakeRuntime } from "@cloud-platform/drivers/testing";
 import { createLogger } from "@cloud-platform/platform";
 import { InMemoryProjectRepository } from "@cloud-platform/platform/testing";
 import { createApp } from "./app.js";
@@ -23,6 +23,7 @@ before(async () => {
     projects: new ProjectsService(
       repository,
       new FakeRouter(),
+      new FakeRuntime(),
       { portRange: { min: 8001, max: 8010 }, maxProjects: 10 },
       logger,
     ),

@@ -25,6 +25,12 @@ export interface ControllerOptions {
   deployTimeoutMs: number;
   /** How often build output is saved while a build runs. */
   logFlushMs?: number;
+  /** Stop apps without network traffic for this long; 0 turns auto-stop off. */
+  idleTimeoutMs?: number;
+  /** How often a running app's traffic is sampled. */
+  activityIntervalMs?: number;
+  /** Least time between attempts to start an app that should run but does not. */
+  restartBackoffMs?: number;
   now?: () => number;
 }
 
@@ -60,6 +66,15 @@ export class DeploymentController {
   private readonly busy = new Set<string>();
   /** Builds in progress, by deployment ID. */
   private readonly builds = new Map<string, RunningBuild>();
+  /** Last traffic sample per running project, for auto-stop. */
+  private readonly activity = new Map<
+    string,
+    { bytes: number; checkedAt: number; activeAt: number }
+  >();
+  /** Last attempt to start a project's app again, so failures are not retried every tick. */
+  private readonly restartAttempts = new Map<string, number>();
+  /** Whether this instance held the controller lock on the last tick. */
+  private leader = false;
   private readonly now: () => number;
 
   constructor(
@@ -88,6 +103,7 @@ export class DeploymentController {
     this.timer = undefined;
     for (const build of this.builds.values()) build.abort.abort();
     await Promise.all([this.running, ...[...this.builds.values()].map((build) => build.done)]);
+    await this.repository.unlockController().catch(() => {});
   }
 
   /** Resolve once every build started so far has finished (for tests). */
@@ -100,6 +116,23 @@ export class DeploymentController {
    * parallel; a failing project never blocks the others.
    */
   async tick(): Promise<void> {
+    // Only one API instance acts; the others wait to take over.
+    let leader = false;
+    try {
+      leader = await this.repository.tryLockController();
+    } catch (error) {
+      this.logger.warn({ err: errorSummary(error) }, "controller could not take its lock");
+    }
+    if (leader !== this.leader) {
+      this.logger.info(
+        leader
+          ? "this instance runs the deployment controller"
+          : "another instance runs the controller",
+      );
+      this.leader = leader;
+    }
+    if (!leader) return;
+
     let work;
     try {
       work = await this.repository.findWork();
@@ -113,6 +146,9 @@ export class DeploymentController {
       ),
       ...work.deployments.map(({ project, deployment }) =>
         this.exclusive(project.id, () => this.advance(project, deployment)),
+      ),
+      ...work.settled.map(({ project, live }) =>
+        this.exclusive(project.id, () => this.reconcile(project, live)),
       ),
     ]);
   }
@@ -137,7 +173,15 @@ export class DeploymentController {
 
     switch (deployment.status) {
       case "pending":
-        if (project.source.type === "repo") {
+        if (deployment.rollbackOf) {
+          // A rollback reuses an earlier image: nothing to build.
+          if (await this.repository.transition(deployment.id, "pending", "deploying")) {
+            log.info(
+              { rollbackOf: deployment.rollbackOf, image: deployment.imageRef },
+              "rollback started",
+            );
+          }
+        } else if (project.source.type === "repo") {
           if (await this.repository.transition(deployment.id, "pending", "building")) {
             log.info({ repoUrl: project.source.repoUrl }, "deployment started; building");
           }
@@ -364,6 +408,74 @@ export class DeploymentController {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Keeping live apps in their desired state
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Make a live project's containers match its desired state: stop a stopped
+   * project, start (or recreate) a running one whose app is not running, and
+   * stop running apps that have been idle for too long.
+   */
+  private async reconcile(project: ProjectRecord, live: DeploymentRecord): Promise<void> {
+    const log = this.logger.child({ projectId: project.id, deploymentId: live.id });
+    const state = await this.runtime.inspect(project.id);
+
+    if (project.desiredState === "stopped") {
+      this.activity.delete(project.id);
+      if (state.state === "running" || state.state === "restarting" || state.state === "starting") {
+        await this.runtime.stop(project.id);
+        log.info({ reason: project.stopReason }, "app stopped");
+      }
+      return;
+    }
+
+    if (state.state === "missing" || state.state === "exited" || state.deploymentId !== live.id) {
+      const now = this.now();
+      const last = this.restartAttempts.get(project.id) ?? 0;
+      if (now - last < (this.options.restartBackoffMs ?? 30_000)) return;
+      this.restartAttempts.set(project.id, now);
+      log.info({ state: state.state }, "starting the live version");
+      try {
+        await this.runtime.start({ ...this.appSpec(project, live), pull: false });
+      } catch (error) {
+        log.warn({ err: errorSummary(error) }, "could not start the live version; will retry");
+      }
+      return;
+    }
+    this.restartAttempts.delete(project.id);
+    if (state.state === "running") await this.checkIdle(project, log);
+  }
+
+  /** Sample the app's traffic and stop it once it has been idle for too long. */
+  private async checkIdle(project: ProjectRecord, log: Logger): Promise<void> {
+    const idleTimeoutMs = this.options.idleTimeoutMs ?? 0;
+    if (idleTimeoutMs <= 0) return;
+    const now = this.now();
+    const seen = this.activity.get(project.id);
+    if (seen && now - seen.checkedAt < (this.options.activityIntervalMs ?? 60_000)) return;
+
+    const bytes = await this.runtime.receivedBytes(project.id);
+    if (bytes === null) return;
+    let activeAt = Math.max(seen?.activeAt ?? 0, project.lastActiveAt.getTime());
+    if (seen && bytes !== seen.bytes) {
+      activeAt = now;
+      await this.repository.markActive(project.id, new Date(now));
+    }
+    this.activity.set(project.id, { bytes, checkedAt: now, activeAt });
+
+    if (now - activeAt >= idleTimeoutMs) {
+      this.activity.delete(project.id);
+      if (await this.repository.setDesiredState(project.id, "stopped", "idle")) {
+        await this.runtime.stop(project.id);
+        log.info(
+          { idleMinutes: Math.round((now - activeAt) / 60_000) },
+          "app stopped after being idle",
+        );
+      }
+    }
+  }
+
   /** After a failed deployment, start the version that was live before it. */
   private async restorePrevious(
     project: ProjectRecord,
@@ -404,6 +516,8 @@ export class DeploymentController {
     await this.runtime.removeData(project.id);
     for (const image of new Set(images)) await this.runtime.removeImage(image);
     await this.repository.remove(project.id);
+    this.activity.delete(project.id);
+    this.restartAttempts.delete(project.id);
     this.logger.info({ projectId: project.id, name: project.name }, "project deleted");
   }
 }

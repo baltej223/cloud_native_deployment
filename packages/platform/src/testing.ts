@@ -16,9 +16,19 @@ import {
   type ProjectLimits,
   type ProjectRecord,
   type ProjectRepository,
+  type ProjectUpdate,
   type ProjectWithLatest,
   type TransitionFields,
 } from "./project-repository.js";
+import type { DesiredState, StopReason } from "@cloud-platform/contracts";
+
+/**
+ * Controller lock shared by every InMemoryProjectRepository given the same
+ * object, to simulate several API instances on one database.
+ */
+export interface SharedLock {
+  owner: object | null;
+}
 
 /** In-memory ProjectRepository with the same rules as the Postgres one, for tests. */
 export class InMemoryProjectRepository implements ProjectRepository {
@@ -26,6 +36,8 @@ export class InMemoryProjectRepository implements ProjectRepository {
   readonly deployments = new Map<string, DeploymentRecord>();
   readonly buildLogs = new Map<string, string>();
   available = true;
+  /** Shared with other instances to test the controller lock. */
+  lock: SharedLock = { owner: null };
   /** Orders deployments created in the same millisecond. */
   private sequence = 0;
   private readonly order = new Map<string, number>();
@@ -59,6 +71,8 @@ export class InMemoryProjectRepository implements ProjectRepository {
       env: input.env,
       assignedPort: port,
       desiredState: "running",
+      stopReason: null,
+      lastActiveAt: now,
       deletedAt: null,
       createdAt: now,
       updatedAt: now,
@@ -86,13 +100,69 @@ export class InMemoryProjectRepository implements ProjectRepository {
     return true;
   }
 
-  async createDeployment(projectId: string): Promise<DeploymentRecord | null> {
+  async update(id: string, changes: ProjectUpdate): Promise<ProjectRecord | null> {
+    const project = this.projects.get(id);
+    if (!project || project.deletedAt) return null;
+    if (changes.containerPort !== undefined) project.containerPort = changes.containerPort;
+    if (changes.healthCheckPath !== undefined) project.healthCheckPath = changes.healthCheckPath;
+    if (changes.env !== undefined) project.env = changes.env;
+    if (project.source.type === "repo") {
+      const source = { ...project.source };
+      for (const key of ["branch", "dockerfilePath", "composeService"] as const) {
+        const value = changes[key];
+        if (value === null) delete source[key];
+        else if (value !== undefined) source[key] = value;
+      }
+      project.source = source;
+    }
+    project.updatedAt = this.now();
+    return { ...project };
+  }
+
+  async setDesiredState(
+    id: string,
+    state: DesiredState,
+    reason: StopReason | null,
+  ): Promise<ProjectRecord | null> {
+    const project = this.projects.get(id);
+    if (!project || project.deletedAt) return null;
+    project.desiredState = state;
+    project.stopReason = state === "running" ? null : reason;
+    if (state === "running") project.lastActiveAt = this.now();
+    project.updatedAt = this.now();
+    return { ...project };
+  }
+
+  async markActive(id: string, at: Date): Promise<void> {
+    const project = this.projects.get(id);
+    if (project && at > project.lastActiveAt) project.lastActiveAt = at;
+  }
+
+  async createDeployment(
+    projectId: string,
+    rollbackOf?: DeploymentRecord,
+  ): Promise<DeploymentRecord | null> {
     const project = this.projects.get(projectId);
     if (!project || project.deletedAt) return null;
     if (this.deploymentsOf(projectId).some((d) => isActiveDeployment(d.status))) {
       throw new DeploymentInProgressError();
     }
-    return { ...this.newDeployment(projectId) };
+    const deployment = this.newDeployment(projectId);
+    if (rollbackOf) {
+      Object.assign(deployment, {
+        rollbackOf: rollbackOf.id,
+        imageRef: rollbackOf.imageRef,
+        commitSha: rollbackOf.commitSha,
+        dockerfilePath: rollbackOf.dockerfilePath,
+        contextPath: rollbackOf.contextPath,
+        containerPort: rollbackOf.containerPort,
+        compose: rollbackOf.compose,
+      });
+    }
+    project.desiredState = "running";
+    project.stopReason = null;
+    project.lastActiveAt = this.now();
+    return { ...deployment };
   }
 
   async listDeployments(projectId: string, limit = 20): Promise<DeploymentRecord[]> {
@@ -126,7 +196,15 @@ export class InMemoryProjectRepository implements ProjectRepository {
     const deletions = [...this.projects.values()]
       .filter((project) => project.deletedAt !== null)
       .map((project) => ({ ...project }));
-    return { deployments, deletions };
+    const settled = [...this.projects.values()]
+      .filter((project) => project.deletedAt === null)
+      .map((project) => ({ project, all: this.deploymentsOf(project.id) }))
+      .filter(({ all }) => !all.some((d) => isActiveDeployment(d.status)))
+      .flatMap(({ project, all }) => {
+        const live = all.find((d) => d.status === "live");
+        return live ? [{ project: { ...project }, live: { ...live } }] : [];
+      });
+    return { deployments, deletions, settled };
   }
 
   async transition(
@@ -168,6 +246,15 @@ export class InMemoryProjectRepository implements ProjectRepository {
     }
   }
 
+  async tryLockController(): Promise<boolean> {
+    if (this.lock.owner === null) this.lock.owner = this;
+    return this.lock.owner === this;
+  }
+
+  async unlockController(): Promise<void> {
+    if (this.lock.owner === this) this.lock.owner = null;
+  }
+
   /** Overridable clock, so tests can simulate time passing. */
   now(): Date {
     return new Date();
@@ -185,6 +272,7 @@ export class InMemoryProjectRepository implements ProjectRepository {
       contextPath: null,
       containerPort: null,
       compose: null,
+      rollbackOf: null,
       failureReason: null,
       createdAt: now,
       updatedAt: now,

@@ -6,7 +6,7 @@ A small platform-as-a-service: paste a public GitHub repository URL, and the pla
 - Plan: [phase-wise-implementation.md](phase-wise-implementation.md)
 - API: [docs/API.md](docs/API.md)
 
-**Status:** Phases 1 and 2 are implemented, plus compose apps from Phase 3: deploy from a GitHub repository (Dockerfile or compose file) or a Docker image, locally.
+**Status:** Phases 1-3 are implemented, locally: deploy from a GitHub repository (Dockerfile or compose file) or a Docker image, then redeploy, roll back, stop, start, edit settings and read the app's logs. Idle apps stop automatically.
 
 ## How it works
 
@@ -29,12 +29,14 @@ Browser ── Next.js dashboard (:3000)
    - **building** (repositories): shallow-clone the repository. If it has a compose file at the root, build or pull each of its services (see below). Otherwise find the Dockerfile (root first, then up to three folders deep, skipping `node_modules`, `.git`, `vendor` and test folders), read the port from the final stage's `EXPOSE`, and build the image with BuildKit (`docker buildx build`), so modern Dockerfile features such as `FROM --platform=$BUILDPLATFORM` and `RUN --mount` work. Output appears live in the dashboard's build log.
    - **deploying**: start a container that publishes the app on the project's port. The app also gets `PORT` set to its container port. Image sources pull the image first.
 3. Once the app answers HTTP on its health check path, the deployment becomes `live`. Otherwise it becomes `failed` with a readable reason: repository not found, no Dockerfile, several Dockerfiles (listed, so you can pick one), no port, build error, crash on start, or no answer within 120 s.
-4. **Redeploy** builds the latest commit again. The old version keeps serving until the new one is live; if the new one fails, the old one is started again.
-5. Deleting a project removes its container and built images, then its record, which frees the name and port.
+4. **Redeploy** builds the latest commit again. The old version keeps serving until the new one is live; if the new one fails, the old one is started again. **Roll back** deploys an earlier version's image without building.
+5. **Stop** and **Start** stop and start the app's containers (data is kept). Apps with no traffic for 2 hours stop automatically (`AUTO_STOP_IDLE_MINUTES`); a running app whose container disappears is started again.
+6. **Edit settings** (variables, port, health check, branch, Dockerfile, compose service) applies to the next deployment. The project page also shows the app's own logs.
+7. Deleting a project removes its containers, volumes and built images, then its record, which frees the name and port.
 
 **Compose apps:** with a `compose.yaml` / `docker-compose.yml` at the root, every service runs as its own container on a network private to the project, reachable by service name; only one service gets the URL (the one that publishes a port, or the one you choose). Named volumes survive redeploys; repository folders a service mounts are copied into its image; host paths, privileged mode, host networking and similar settings are refused. Details in [docs/API.md](docs/API.md).
 
-There is no queue: the database records what should exist, and the controller makes the container engine match it. Every step is safe to repeat, so restarting the platform resumes unfinished deployments; an interrupted build starts again.
+There is no queue: the database records what should exist, and the controller makes the container engine match it. Every step is safe to repeat, so restarting the platform resumes unfinished deployments; an interrupted build starts again. When several API instances run, a PostgreSQL advisory lock lets only one of them run the controller.
 
 **Isolation:** apps run on their own network (`cloud-platform-apps`), separate from the database. Each app is limited to 512 MB of memory and half a CPU, and gets no platform credentials. Builds time out after 15 minutes, and build contexts over 500 MB are refused.
 

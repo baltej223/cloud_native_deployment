@@ -28,9 +28,9 @@ export const loadConfig = () =>
           .filter(Boolean),
       ),
 
-    /** Where apps run. Only "local" (Docker or Podman on this machine) exists so far. */
+    /** Where apps run. Only "local" (Docker on this machine) exists so far. */
     PLATFORM_DRIVER: z.enum(["local"]).default("local"),
-    /** Docker or Podman API socket, as seen by the API process. */
+    /** Docker API socket, as seen by the API process. */
     DOCKER_SOCKET: z.string().min(1).default("/var/run/docker.sock"),
     /** Network for app containers; empty to use the engine's default network. */
     APP_NETWORK: z.string().default(""),
@@ -56,6 +56,8 @@ export const loadConfig = () =>
     DEPLOY_HEALTH_TIMEOUT_SECONDS: z.coerce.number().int().min(5).default(120),
     /** Upper bound for the deploy step (after any build), including pulling the image. */
     DEPLOY_TIMEOUT_SECONDS: z.coerce.number().int().min(30).default(600),
+    /** Stop apps that had no network traffic for this long; 0 turns auto-stop off. */
+    AUTO_STOP_IDLE_MINUTES: z.coerce.number().int().min(0).default(120),
   });
 
 export type ApiConfig = ReturnType<typeof loadConfig>;

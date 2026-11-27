@@ -167,3 +167,77 @@ test("no free port is reported when the range is used up", { skip }, async () =>
     NoFreePortError,
   );
 });
+
+test("settings, stop/start and rollback", { skip }, async () => {
+  await pool.query("DELETE FROM projects");
+  const { project, deployment: first } = await repo("seven");
+
+  const updated = await repository.update(project.id, {
+    env: { B: "2" },
+    containerPort: 8080,
+    branch: null,
+    composeService: "web",
+  });
+  assert.deepEqual(updated!.env, { B: "2" });
+  assert.equal(updated!.containerPort, 8080);
+  assert.deepEqual(updated!.source, {
+    type: "repo",
+    repoUrl: "https://github.com/acme/seven",
+    composeService: "web",
+  });
+
+  // First version live with build details.
+  await repository.transition(first.id, "pending", "building");
+  await repository.transition(first.id, "building", "deploying", {
+    imageRef: "localhost/app:1",
+    commitSha: "a".repeat(40),
+    containerPort: 3000,
+    compose: { file: "compose.yaml", publicService: "web", services: [] },
+  });
+  await repository.transition(first.id, "deploying", "live");
+  assert.deepEqual(
+    (await repository.findWork()).settled.map(({ live }) => live.id),
+    [first.id],
+  );
+
+  // Stop and start.
+  const stopped = await repository.setDesiredState(project.id, "stopped", "idle");
+  assert.equal(stopped!.desiredState, "stopped");
+  assert.equal(stopped!.stopReason, "idle");
+  const started = await repository.setDesiredState(project.id, "running", "idle");
+  assert.equal(started!.stopReason, null);
+  assert.ok(started!.lastActiveAt >= stopped!.lastActiveAt);
+  const later = new Date(Date.now() + 60_000);
+  await repository.markActive(project.id, later);
+  assert.equal((await repository.get(project.id))!.project.lastActiveAt.getTime(), later.getTime());
+
+  // A second version, then a rollback to the first.
+  const second = (await repository.createDeployment(project.id))!;
+  assert.equal((await repository.findWork()).settled.length, 0, "not settled while deploying");
+  await repository.transition(second.id, "pending", "deploying", { imageRef: "localhost/app:2" });
+  await repository.transition(second.id, "deploying", "live");
+  await repository.setDesiredState(project.id, "stopped", "user");
+
+  const target = (await repository.getDeployment(first.id))!;
+  const rollback = (await repository.createDeployment(project.id, target))!;
+  assert.equal(rollback.rollbackOf, first.id);
+  assert.equal(rollback.imageRef, "localhost/app:1");
+  assert.equal(rollback.containerPort, 3000);
+  assert.equal(rollback.compose?.publicService, "web");
+  assert.equal(
+    (await repository.get(project.id))!.project.desiredState,
+    "running",
+    "deploying starts the project",
+  );
+});
+
+test("only one connection holds the controller lock", { skip }, async () => {
+  const other = new PostgresProjectRepository(pool);
+  assert.equal(await repository.tryLockController(), true);
+  assert.equal(await repository.tryLockController(), true, "still held");
+  assert.equal(await other.tryLockController(), false);
+  await repository.unlockController();
+  assert.equal(await other.tryLockController(), true);
+  assert.equal(await repository.tryLockController(), false);
+  await other.unlockController();
+});

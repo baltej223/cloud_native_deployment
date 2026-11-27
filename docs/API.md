@@ -107,7 +107,56 @@ Errors: `400 INVALID_INPUT`, `409 NAME_TAKEN` (for a derived name, set `name`), 
 
 ### `GET /projects/:id`
 
-One `ProjectView`. `latestDeployment` is the newest deployment; `liveDeployment` is the one serving the URL, which can be older (for example while a redeploy builds, or after it failed). `404 PROJECT_NOT_FOUND` for unknown IDs.
+One `ProjectView`. Besides the fields shown under `POST /projects`, it has `desiredState` (`running` or `stopped`), `stopReason` (`user`, `idle` or `null`) and `lastActiveAt` (last network traffic, or the last start). `latestDeployment` is the newest deployment; `liveDeployment` is the one serving the URL, which can be older (for example while a redeploy builds, or after it failed). `404 PROJECT_NOT_FOUND` for unknown IDs.
+
+### `PATCH /projects/:id`
+
+Change settings. Every field is optional; send only what changes. Changes apply to the next deployment (redeploy, rollback, or a restart of the live version), not to the running app.
+
+```json
+{ "env": { "GREETING": "hi" }, "containerPort": 8080, "composeService": "web" }
+```
+
+| Field                                        | Notes                                                     |
+| -------------------------------------------- | --------------------------------------------------------- |
+| `containerPort`                              | `null` (repositories only) goes back to detecting it      |
+| `healthCheckPath`, `env`                     | Same rules as when creating; `env` replaces all variables |
+| `branch`, `dockerfilePath`, `composeService` | Repositories only; `null` goes back to the default        |
+
+The name, source type and repository URL cannot be changed (`400 INVALID_INPUT`). Returns the updated `ProjectView`.
+
+### `POST /projects/:id/stop` and `POST /projects/:id/start`
+
+Stop the app, or start it again. Both return `202` with the `ProjectView`; the controller stops or starts the containers within a few seconds. Stopping keeps the containers, images and volumes, and frees the app's memory and CPU; starting runs the live version again without building. A stopped project's `status` is `stopped`.
+
+- `409 NO_LIVE_DEPLOYMENT` if the project has never gone live.
+- `409 DEPLOYMENT_IN_PROGRESS` when stopping during a deployment.
+
+Redeploying or rolling back a stopped project starts it.
+
+**Auto-stop:** apps with no network traffic for `AUTO_STOP_IDLE_MINUTES` (default 120; 0 turns it off) are stopped with `stopReason: "idle"`. Traffic is sampled once a minute from the public container's network counters; an app that talks to its own services in the background counts as active.
+
+**Self-healing:** if a running project's container disappears or stops (for example, removed by hand or after a server restart), the controller starts the live version again, at most every 30 seconds.
+
+### `GET /projects/:id/logs`
+
+The last lines the running app wrote to stdout and stderr, with timestamps.
+
+| Query     | Notes                                               |
+| --------- | --------------------------------------------------- |
+| `tail`    | Lines, 1-2000; default 200                          |
+| `service` | Compose apps: which service; default the public one |
+
+```json
+{
+  "projectId": "…",
+  "service": "vote",
+  "services": ["redis", "vote", "db", "result", "worker"],
+  "log": "2026-11-27T10:00:00.000000000Z  * Running on http://0.0.0.0:80\n"
+}
+```
+
+`log` is empty when the app is not running. `service` is `null` for single-container apps.
 
 ### `DELETE /projects/:id`
 
@@ -120,6 +169,12 @@ Returns `202 { "id": "…", "status": "deleting" }`. The controller stops any bu
 Redeploy: build the latest commit of the branch again (or pull the image again). Returns `202` with the new `DeploymentView`. The current version keeps serving until the new one is live; if the new one fails, the previous version is started again.
 
 `409 DEPLOYMENT_IN_PROGRESS` while another deployment of the project is pending, building or deploying.
+
+### `POST /projects/:id/rollback`
+
+Deploy an earlier version again from its image, without building: `{ "deploymentId": "…" }`. Only deployments that were live (`superseded`) can be chosen. The new deployment has `rollbackOf` set and goes `pending → deploying → live`. It uses the earlier version's image, commit, port and compose services, with the project's current environment variables and health check. Returns `202` with the new `DeploymentView`.
+
+`404 DEPLOYMENT_NOT_FOUND`, `409 ROLLBACK_NOT_POSSIBLE` (already live, or never live), `409 DEPLOYMENT_IN_PROGRESS`.
 
 ### `GET /projects/:id/deployments`
 
@@ -146,7 +201,7 @@ Only the last 256 KB are kept (`truncated` is then `true`). Image deployments ha
 
 ## Statuses
 
-A project's `status` is its latest deployment's status, or `deleting`.
+A project's `status` is its latest deployment's status, `stopped` (stopped and nothing in progress) or `deleting`.
 
 ```text
 pending ──► building ──► deploying ──► live ──► superseded   (when a newer deployment goes live)
@@ -154,10 +209,10 @@ pending ──► building ──► deploying ──► live ──► supersed
    │            ▼             ▼
    └────────► failed ◄────────┘      (failureReason says why)
 
-pending ──► deploying                (image sources skip the build)
+pending ──► deploying                (image sources and rollbacks skip the build)
 ```
 
-`cancelled` is reserved for later phases. Deployments never move backwards; the database rejects invalid transitions.
+`cancelled` is reserved for later use. Deployments never move backwards; the database rejects invalid transitions.
 
 Typical failure reasons:
 
@@ -178,4 +233,6 @@ Typical failure reasons:
 ## Health
 
 - `GET /health/live`: `200 {"status":"ok"}` while the process runs.
+  **Several API instances:** only the instance holding a PostgreSQL advisory lock runs the deployment controller; the others serve HTTP and take over within one tick if it stops. With Supabase, use the session pooler (port 5432); the transaction pooler does not keep advisory locks.
+
 - `GET /health/ready`: `200` when the database and the container engine are reachable, otherwise `503` with `checks` naming the failing dependency.

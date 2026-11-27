@@ -9,6 +9,8 @@ import type {
   ProjectSource,
   ProjectStatus,
   ProjectView,
+  RuntimeLogResponse,
+  UpdateProjectRequest,
 } from "@cloud-platform/contracts";
 
 /** Empty means "same origin" (the platform's load balancer routes the API paths). */
@@ -65,6 +67,39 @@ export const redeployProject = (id: string) =>
     "Could not start a new deployment.",
   );
 
+const jsonRequest = (method: string, body?: unknown): RequestInit => ({
+  method,
+  headers: { "content-type": "application/json" },
+  body: body === undefined ? undefined : JSON.stringify(body),
+});
+
+export const updateProject = (id: string, changes: UpdateProjectRequest) =>
+  call<ProjectView>(
+    `/projects/${id}`,
+    jsonRequest("PATCH", changes),
+    "Could not save the settings.",
+  );
+
+export const stopProject = (id: string) =>
+  call<ProjectView>(`/projects/${id}/stop`, { method: "POST" }, "Could not stop the app.");
+
+export const startProject = (id: string) =>
+  call<ProjectView>(`/projects/${id}/start`, { method: "POST" }, "Could not start the app.");
+
+export const rollbackProject = (id: string, deploymentId: string) =>
+  call<DeploymentView>(
+    `/projects/${id}/rollback`,
+    jsonRequest("POST", { deploymentId }),
+    "Could not roll back.",
+  );
+
+export const getRuntimeLogs = (id: string, service: string | null, tail = 300) =>
+  call<RuntimeLogResponse>(
+    `/projects/${id}/logs?tail=${tail}${service ? `&service=${encodeURIComponent(service)}` : ""}`,
+    {},
+    "Could not load the app's logs.",
+  );
+
 export const listDeployments = async (projectId: string) =>
   (
     await call<ListDeploymentsResponse>(
@@ -96,5 +131,6 @@ export const STATUS_LABELS: Record<ProjectStatus, string> = {
   failed: "Failed",
   superseded: "Replaced",
   cancelled: "Cancelled",
+  stopped: "Stopped",
   deleting: "Deleting",
 };

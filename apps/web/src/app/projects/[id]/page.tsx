@@ -12,8 +12,13 @@ import {
   isSettling,
   listDeployments,
   redeployProject,
+  rollbackProject,
+  startProject,
+  stopProject,
 } from "@/lib/api";
 import { StatusPill } from "../../status-pill";
+import { RuntimeLogs } from "./runtime-logs";
+import { SettingsForm } from "./settings-form";
 
 const POLL_MS = 2_000;
 
@@ -39,7 +44,8 @@ export default function ProjectPage() {
   const [error, setError] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
-  const [redeploying, setRedeploying] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
   const logRef = useRef<HTMLPreElement>(null);
 
   const refresh = useCallback(async () => {
@@ -100,20 +106,30 @@ export default function ProjectPage() {
     if (logRef.current && logIsLive) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [buildLog, logIsLive]);
 
-  async function onRedeploy() {
-    setRedeploying(true);
+  /** Run an action, then show its effect (or its error). */
+  async function act(action: () => Promise<unknown>, fallback: string) {
+    setBusy(true);
     try {
-      await redeployProject(id);
-      setSelected(null);
+      await action();
       await refresh();
-    } catch (redeployError) {
-      setError(
-        redeployError instanceof Error ? redeployError.message : "Could not start a deployment.",
-      );
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : fallback);
     } finally {
-      setRedeploying(false);
+      setBusy(false);
     }
   }
+
+  const onRedeploy = () =>
+    act(async () => {
+      await redeployProject(id);
+      setSelected(null);
+    }, "Could not start a deployment.");
+
+  const onRollback = (deploymentId: string) =>
+    act(async () => {
+      await rollbackProject(id, deploymentId);
+      setSelected(null);
+    }, "Could not roll back.");
 
   async function onDelete() {
     setDeleting(true);
@@ -132,6 +148,7 @@ export default function ProjectPage() {
   const live = project?.liveDeployment;
   const envEntries = project ? Object.entries(project.env) : [];
   const inProgress = latest ? isSettling(latest.status) : false;
+  const stopped = project?.status === "stopped";
 
   return (
     <main className="shell">
@@ -152,7 +169,7 @@ export default function ProjectPage() {
 
             <div className="card detail">
               <p className="eyebrow">URL</p>
-              {live ? (
+              {live && !stopped ? (
                 <a href={project.url} target="_blank" rel="noreferrer" className="big-url">
                   {project.url} ↗
                 </a>
@@ -177,18 +194,67 @@ export default function ProjectPage() {
                   {formatTime(live.finishedAt)}).
                 </p>
               )}
+              {stopped && (
+                <p className="muted">
+                  {project.stopReason === "idle"
+                    ? `Stopped automatically: no traffic since ${formatTime(project.lastActiveAt)}.`
+                    : "Stopped. Its containers and data are kept."}{" "}
+                  Start it to serve the URL again.
+                </p>
+              )}
               {project.status !== "deleting" && (
                 <div className="actions">
-                  <button onClick={onRedeploy} disabled={redeploying || inProgress}>
-                    {inProgress
-                      ? "Deploying…"
-                      : isRepo
-                        ? "Redeploy latest commit"
-                        : "Redeploy (pull image again)"}
+                  {stopped ? (
+                    <button
+                      onClick={() => act(() => startProject(id), "Could not start the app.")}
+                      disabled={busy}
+                    >
+                      Start
+                    </button>
+                  ) : (
+                    <button onClick={onRedeploy} disabled={busy || inProgress}>
+                      {inProgress
+                        ? "Deploying…"
+                        : isRepo
+                          ? "Redeploy latest commit"
+                          : "Redeploy (pull image again)"}
+                    </button>
+                  )}
+                  {live && !stopped && (
+                    <button
+                      className="button-quiet"
+                      onClick={() => act(() => stopProject(id), "Could not stop the app.")}
+                      disabled={busy || inProgress}
+                    >
+                      Stop
+                    </button>
+                  )}
+                  <button
+                    className="button-quiet"
+                    onClick={() => setEditing((value) => !value)}
+                    disabled={busy}
+                  >
+                    Edit settings
                   </button>
                 </div>
               )}
             </div>
+
+            {editing && project.status !== "deleting" && (
+              <div className="card detail">
+                <p className="eyebrow">Settings</p>
+                <p className="muted">Changes apply to the next deployment.</p>
+                <SettingsForm
+                  project={project}
+                  onCancel={() => setEditing(false)}
+                  onSaved={(saved, redeploy) => {
+                    setProject(saved);
+                    setEditing(false);
+                    if (redeploy) void onRedeploy();
+                  }}
+                />
+              </div>
+            )}
 
             <div className="card detail">
               <dl>
@@ -228,7 +294,9 @@ export default function ProjectPage() {
                       </>
                     )}
                     <dt>Commit</dt>
-                    <dd className="mono">{shortSha(latest?.commitSha ?? null)}</dd>
+                    <dd className="mono">
+                      {shortSha(live?.commitSha ?? latest?.commitSha ?? null)}
+                    </dd>
                   </>
                 )}
                 <dt>Container port</dt>
@@ -259,6 +327,10 @@ export default function ProjectPage() {
               </dl>
             </div>
 
+            {live && (
+              <RuntimeLogs projectId={id} running={!stopped && project.status !== "deleting"} />
+            )}
+
             {isRepo && shownDeployment && (
               <div className="card detail">
                 <div className="log-heading">
@@ -286,7 +358,7 @@ export default function ProjectPage() {
                     <th>Status</th>
                     {isRepo && <th>Commit</th>}
                     <th>Took</th>
-                    {isRepo && <th />}
+                    <th />
                   </tr>
                 </thead>
                 <tbody>
@@ -300,14 +372,26 @@ export default function ProjectPage() {
                         <StatusPill status={deployment.status} />
                       </td>
                       {isRepo && <td className="mono">{shortSha(deployment.commitSha)}</td>}
-                      <td>{duration(deployment.createdAt, deployment.finishedAt) ?? "—"}</td>
-                      {isRepo && (
-                        <td>
+                      <td>
+                        {duration(deployment.createdAt, deployment.finishedAt) ?? "—"}
+                        {deployment.rollbackOf && <span className="muted"> · rollback</span>}
+                      </td>
+                      <td>
+                        {isRepo && !deployment.rollbackOf && (
                           <button className="link" onClick={() => setSelected(deployment.id)}>
                             View log
                           </button>
-                        </td>
-                      )}
+                        )}
+                        {deployment.status === "superseded" && deployment.imageRef && (
+                          <button
+                            className="link"
+                            onClick={() => onRollback(deployment.id)}
+                            disabled={busy || inProgress}
+                          >
+                            Roll back to this
+                          </button>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>

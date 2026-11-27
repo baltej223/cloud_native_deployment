@@ -93,6 +93,35 @@ export function createApp({ projects, logger, allowedOrigins, readinessChecks }:
     response.status(202).json({ id: request.params.id, status: "deleting" });
   });
 
+  app.patch("/projects/:id", async (request, response) => {
+    response.json(await projects.update(request.params.id, request.body));
+  });
+
+  app.post("/projects/:id/stop", async (request, response) => {
+    response.status(202).json(await projects.stop(request.params.id));
+  });
+
+  app.post("/projects/:id/start", async (request, response) => {
+    response.status(202).json(await projects.start(request.params.id));
+  });
+
+  app.post("/projects/:id/rollback", async (request, response) => {
+    const deployment = await projects.rollback(request.params.id, request.body);
+    response.status(202).location(`/deployments/${deployment.id}`).json(deployment);
+  });
+
+  app.get("/projects/:id/logs", async (request, response) => {
+    const { service, tail } = request.query;
+    response.setHeader("Cache-Control", "no-store");
+    response.json(
+      await projects.runtimeLogs(
+        request.params.id,
+        typeof service === "string" && service ? service : undefined,
+        typeof tail === "string" ? tail : undefined,
+      ),
+    );
+  });
+
   app.post("/projects/:id/deployments", async (request, response) => {
     const deployment = await projects.redeploy(request.params.id);
     response.status(202).location(`/deployments/${deployment.id}`).json(deployment);

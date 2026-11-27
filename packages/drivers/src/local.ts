@@ -209,6 +209,58 @@ export class LocalRuntime implements Runtime {
     for (const name of names) await this.engine.removeContainer(name);
   }
 
+  /** Container names of a version, in start order (dependencies first). */
+  private containerNames(spec: AppSpec): string[] {
+    if (!spec.compose) return [appName(spec.projectId)];
+    return spec.compose.services.map((service) =>
+      service.name === spec.compose!.publicService
+        ? appName(spec.projectId)
+        : serviceContainerName(spec.projectId, service.name),
+    );
+  }
+
+  async stop(projectId: string): Promise<void> {
+    const names = await this.engine.listContainers(`${LABELS.project}=${projectId}`);
+    // The public container first, so no request reaches a half-stopped app.
+    const ordered = [appName(projectId), ...names.filter((name) => name !== appName(projectId))];
+    for (const name of ordered) await this.engine.stopContainer(name);
+  }
+
+  async start(spec: AppSpec): Promise<void> {
+    const names = this.containerNames(spec);
+    const existing = await Promise.all(names.map((name) => this.engine.inspectContainer(name)));
+    const sameVersion = existing.every(
+      (container) => container?.Config.Labels?.[LABELS.deployment] === spec.deploymentId,
+    );
+    if (!sameVersion) return this.deploy({ ...spec, pull: false });
+    try {
+      for (const name of names) await this.engine.startContainer(name);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (PORT_IN_USE.test(message)) {
+        throw new DeployError(
+          `Port ${spec.publicPort} on the host is already in use by another program.`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  async logs(projectId: string, service: string | null, tail: number): Promise<string | null> {
+    const name = service ? serviceContainerName(projectId, service) : appName(projectId);
+    // The public service of a compose app runs under the project's main name.
+    const log = await this.engine.containerLogs(name, tail);
+    if (log !== null || !service) return log;
+    const main = await this.engine.inspectContainer(appName(projectId));
+    return main?.Config.Labels?.[LABELS.service] === service
+      ? this.engine.containerLogs(appName(projectId), tail)
+      : null;
+  }
+
+  receivedBytes(projectId: string): Promise<number | null> {
+    return this.engine.receivedBytes(appName(projectId));
+  }
+
   async removeData(projectId: string): Promise<void> {
     for (const volume of await this.engine.listVolumes(`${LABELS.project}=${projectId}`)) {
       await this.engine.removeVolume(volume);

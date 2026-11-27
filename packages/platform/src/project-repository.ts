@@ -3,7 +3,9 @@ import {
   canTransition,
   type ComposePlan,
   type DeploymentStatus,
+  type DesiredState,
   type ProjectSource,
+  type StopReason,
 } from "@cloud-platform/contracts";
 import type pg from "pg";
 import type { DatabasePool } from "./database.js";
@@ -17,7 +19,10 @@ export interface ProjectRecord {
   healthCheckPath: string;
   env: Record<string, string>;
   assignedPort: number;
-  desiredState: "running" | "stopped";
+  desiredState: DesiredState;
+  stopReason: StopReason | null;
+  /** Last network activity of the app, or when it was last started. */
+  lastActiveAt: Date;
   deletedAt: Date | null;
   createdAt: Date;
   updatedAt: Date;
@@ -34,6 +39,8 @@ export interface DeploymentRecord {
   containerPort: number | null;
   /** Compose apps: the services this deployment runs. */
   compose: ComposePlan | null;
+  /** The earlier deployment whose image this one reuses (a rollback). */
+  rollbackOf: string | null;
   failureReason: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -102,10 +109,25 @@ export interface TransitionFields {
   compose?: ComposePlan;
 }
 
+/** Changes to a project's settings; null resets a repository setting to automatic. */
+export interface ProjectUpdate {
+  containerPort?: number | null;
+  healthCheckPath?: string;
+  env?: Record<string, string>;
+  branch?: string | null;
+  dockerfilePath?: string | null;
+  composeService?: string | null;
+}
+
 /** Work the deployment controller has to do. */
 export interface ControllerWork {
   /** Deployments in progress (pending, building, deploying) of projects not being deleted. */
   deployments: Array<{ project: ProjectRecord; deployment: DeploymentRecord }>;
+  /**
+   * Projects with a live deployment and nothing in progress: their containers
+   * must match the desired state (running or stopped).
+   */
+  settled: Array<{ project: ProjectRecord; live: DeploymentRecord }>;
   /** Projects marked for deletion whose app still has to be removed. */
   deletions: ProjectRecord[];
 }
@@ -122,12 +144,29 @@ export interface ProjectRepository {
   get(id: string): Promise<ProjectWithLatest | null>;
   /** Mark a project for deletion. Returns false if it does not exist. */
   markDeleted(id: string): Promise<boolean>;
+  /** Change settings of a project that is not being deleted. Returns null if there is none. */
+  update(id: string, changes: ProjectUpdate): Promise<ProjectRecord | null>;
   /**
-   * Start a new deployment of an existing project (a redeploy). Returns null
-   * if the project does not exist or is being deleted; throws
+   * Start or stop a project. Starting clears the stop reason and counts as
+   * activity. Returns null if the project does not exist or is being deleted.
+   */
+  setDesiredState(
+    id: string,
+    state: DesiredState,
+    reason: StopReason | null,
+  ): Promise<ProjectRecord | null>;
+  /** Record that the app had network traffic at `at`. */
+  markActive(id: string, at: Date): Promise<void>;
+  /**
+   * Start a new deployment of an existing project: a redeploy, or a rollback
+   * that reuses `rollbackOf`'s image. The project is set to running. Returns
+   * null if the project does not exist or is being deleted; throws
    * DeploymentInProgressError if one is already running.
    */
-  createDeployment(projectId: string): Promise<DeploymentRecord | null>;
+  createDeployment(
+    projectId: string,
+    rollbackOf?: DeploymentRecord,
+  ): Promise<DeploymentRecord | null>;
   /** A project's deployments, newest first. */
   listDeployments(projectId: string, limit?: number): Promise<DeploymentRecord[]>;
   getDeployment(id: string): Promise<DeploymentRecord | null>;
@@ -148,6 +187,13 @@ export interface ProjectRepository {
   ): Promise<DeploymentRecord | null>;
   /** Delete the project row and its deployments (after its app is removed). */
   remove(id: string): Promise<void>;
+  /**
+   * Try to become the one controller allowed to act (a PostgreSQL advisory
+   * lock held for as long as this process keeps its connection). True while
+   * this instance holds it; safe to call every tick.
+   */
+  tryLockController(): Promise<boolean>;
+  unlockController(): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,7 +213,9 @@ interface ProjectRow {
   health_check_path: string;
   env: Record<string, string>;
   assigned_port: number;
-  desired_state: "running" | "stopped";
+  desired_state: DesiredState;
+  stop_reason: StopReason | null;
+  last_active_at: Date;
   deleted_at: Date | null;
   created_at: Date;
   updated_at: Date;
@@ -184,6 +232,7 @@ interface DeploymentRow {
   context_path: string | null;
   container_port: number | null;
   compose: ComposePlan | null;
+  rollback_of: string | null;
   failure_reason: string | null;
   created_at: Date | string;
   updated_at: Date | string;
@@ -215,6 +264,8 @@ function toProject(row: ProjectRow): ProjectRecord {
     env: row.env,
     assignedPort: row.assigned_port,
     desiredState: row.desired_state,
+    stopReason: row.stop_reason,
+    lastActiveAt: row.last_active_at,
     deletedAt: row.deleted_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -232,6 +283,7 @@ function toDeployment(row: DeploymentRow): DeploymentRecord {
     contextPath: row.context_path,
     containerPort: row.container_port,
     compose: row.compose ?? null,
+    rollbackOf: row.rollback_of,
     failureReason: row.failure_reason,
     createdAt: date(row.created_at),
     updatedAt: date(row.updated_at),
@@ -242,12 +294,13 @@ function toDeployment(row: DeploymentRow): DeploymentRecord {
 }
 
 const PROJECT_COLUMNS = `p.id, p.name, p.source_type, p.image, p.repo_url, p.branch, p.dockerfile_path,
-  p.compose_service, p.container_port, p.health_check_path, p.env, p.assigned_port, p.desired_state, p.deleted_at,
+  p.compose_service, p.container_port, p.health_check_path, p.env, p.assigned_port, p.desired_state, p.stop_reason,
+  p.last_active_at, p.deleted_at,
   p.created_at, p.updated_at`;
 
 /** Everything except the (large) build log. */
 const DEPLOYMENT_COLUMNS = `d.id, d.project_id, d.status, d.image_ref, d.commit_sha, d.dockerfile_path,
-  d.context_path, d.container_port, d.compose, d.failure_reason, d.created_at, d.updated_at, d.started_at,
+  d.context_path, d.container_port, d.compose, d.rollback_of, d.failure_reason, d.created_at, d.updated_at, d.started_at,
   d.deploy_started_at, d.finished_at`;
 
 /** A project with its latest and live deployments as JSON columns. */
@@ -275,6 +328,8 @@ function toProjectWithLatest(row: ProjectWithDeploymentsRow): ProjectWithLatest 
 
 /** Serialises project creation so the project limit and port choice cannot race. */
 const CREATE_LOCK_ID = 7_241_999;
+/** Held by the one API instance that runs the deployment controller. */
+const CONTROLLER_LOCK_ID = 7_242_000;
 
 /** Build logs keep their last 256 KB. */
 export const BUILD_LOG_MAX_CHARS = 256 * 1024;
@@ -284,6 +339,9 @@ const isUniqueViolation = (error: unknown, constraint: string) =>
   (error as { constraint?: string }).constraint === constraint;
 
 export class PostgresProjectRepository implements ProjectRepository {
+  /** Connection that holds the controller lock (advisory locks belong to a session). */
+  private lockClient: pg.PoolClient | null = null;
+
   constructor(private readonly pool: DatabasePool) {}
 
   async ping(): Promise<void> {
@@ -373,15 +431,90 @@ export class PostgresProjectRepository implements ProjectRepository {
     return rowCount === 1;
   }
 
-  async createDeployment(projectId: string): Promise<DeploymentRecord | null> {
+  async update(id: string, changes: ProjectUpdate): Promise<ProjectRecord | null> {
+    const columns: Array<[string, unknown]> = [];
+    if (changes.containerPort !== undefined)
+      columns.push(["container_port", changes.containerPort]);
+    if (changes.healthCheckPath !== undefined) {
+      columns.push(["health_check_path", changes.healthCheckPath]);
+    }
+    if (changes.env !== undefined) columns.push(["env", JSON.stringify(changes.env)]);
+    if (changes.branch !== undefined) columns.push(["branch", changes.branch]);
+    if (changes.dockerfilePath !== undefined) {
+      columns.push(["dockerfile_path", changes.dockerfilePath]);
+    }
+    if (changes.composeService !== undefined) {
+      columns.push(["compose_service", changes.composeService]);
+    }
+    const assignments = columns.map(([column], index) => `${column} = $${index + 2}`);
+    const { rows } = await this.pool.query<ProjectRow>(
+      `UPDATE projects AS p SET ${[...assignments, "updated_at = now()"].join(", ")}
+        WHERE id = $1 AND deleted_at IS NULL
+        RETURNING ${PROJECT_COLUMNS}`,
+      [id, ...columns.map(([, value]) => value)],
+    );
+    return rows[0] ? toProject(rows[0]) : null;
+  }
+
+  async setDesiredState(
+    id: string,
+    state: DesiredState,
+    reason: StopReason | null,
+  ): Promise<ProjectRecord | null> {
+    const { rows } = await this.pool.query<ProjectRow>(
+      `UPDATE projects AS p
+          SET desired_state = $2,
+              stop_reason = $3,
+              last_active_at = CASE WHEN $2 = 'running' THEN now() ELSE last_active_at END,
+              updated_at = now()
+        WHERE id = $1 AND deleted_at IS NULL
+        RETURNING ${PROJECT_COLUMNS}`,
+      [id, state, state === "running" ? null : reason],
+    );
+    return rows[0] ? toProject(rows[0]) : null;
+  }
+
+  async markActive(id: string, at: Date): Promise<void> {
+    await this.pool.query(
+      "UPDATE projects SET last_active_at = greatest(last_active_at, $2) WHERE id = $1",
+      [id, at],
+    );
+  }
+
+  async createDeployment(
+    projectId: string,
+    rollbackOf?: DeploymentRecord,
+  ): Promise<DeploymentRecord | null> {
     try {
-      const { rows } = await this.pool.query<DeploymentRow>(
-        `INSERT INTO deployments AS d (id, project_id)
-         SELECT $1, id FROM projects WHERE id = $2 AND deleted_at IS NULL
-         RETURNING ${DEPLOYMENT_COLUMNS}`,
-        [randomUUID(), projectId],
-      );
-      return rows[0] ? toDeployment(rows[0]) : null;
+      return await this.inTransaction(async (client) => {
+        const { rows } = await client.query<DeploymentRow>(
+          `INSERT INTO deployments AS d (id, project_id, rollback_of, image_ref, commit_sha,
+             dockerfile_path, context_path, container_port, compose)
+           SELECT $1, id, $3, $4, $5, $6, $7, $8, $9
+             FROM projects WHERE id = $2 AND deleted_at IS NULL
+           RETURNING ${DEPLOYMENT_COLUMNS}`,
+          [
+            randomUUID(),
+            projectId,
+            rollbackOf?.id ?? null,
+            rollbackOf?.imageRef ?? null,
+            rollbackOf?.commitSha ?? null,
+            rollbackOf?.dockerfilePath ?? null,
+            rollbackOf?.contextPath ?? null,
+            rollbackOf?.containerPort ?? null,
+            rollbackOf?.compose ? JSON.stringify(rollbackOf.compose) : null,
+          ],
+        );
+        if (!rows[0]) return null;
+        // Deploying a project means it should run.
+        await client.query(
+          `UPDATE projects SET desired_state = 'running', stop_reason = NULL,
+              last_active_at = now(), updated_at = now()
+            WHERE id = $1`,
+          [projectId],
+        );
+        return toDeployment(rows[0]);
+      });
     } catch (error) {
       if (isUniqueViolation(error, "deployments_one_active_per_project")) {
         throw new DeploymentInProgressError();
@@ -423,7 +556,7 @@ export class PostgresProjectRepository implements ProjectRepository {
   }
 
   async findWork(): Promise<ControllerWork> {
-    const [active, deleting] = await Promise.all([
+    const [active, deleting, settled] = await Promise.all([
       this.pool.query<ProjectRow & { deployment: DeploymentRow }>(
         `SELECT ${PROJECT_COLUMNS}, row_to_json(x) AS deployment
            FROM projects p
@@ -437,6 +570,19 @@ export class PostgresProjectRepository implements ProjectRepository {
       this.pool.query<ProjectRow>(
         `SELECT ${PROJECT_COLUMNS} FROM projects p WHERE p.deleted_at IS NOT NULL`,
       ),
+      this.pool.query<ProjectRow & { live: DeploymentRow }>(
+        `SELECT ${PROJECT_COLUMNS}, row_to_json(x) AS live
+           FROM projects p
+           JOIN LATERAL (
+             SELECT ${DEPLOYMENT_COLUMNS} FROM deployments d
+              WHERE d.project_id = p.id AND d.status = 'live'
+           ) x ON true
+          WHERE p.deleted_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM deployments a
+               WHERE a.project_id = p.id AND a.status IN ('pending', 'building', 'deploying'))
+          ORDER BY p.created_at`,
+      ),
     ]);
     return {
       deployments: active.rows.map((row) => ({
@@ -444,6 +590,10 @@ export class PostgresProjectRepository implements ProjectRepository {
         deployment: toDeployment(row.deployment),
       })),
       deletions: deleting.rows.map(toProject),
+      settled: settled.rows.map((row) => ({
+        project: toProject(row),
+        live: toDeployment(row.live),
+      })),
     };
   }
 
@@ -504,6 +654,49 @@ export class PostgresProjectRepository implements ProjectRepository {
 
   async remove(id: string): Promise<void> {
     await this.pool.query("DELETE FROM projects WHERE id = $1", [id]);
+  }
+
+  async tryLockController(): Promise<boolean> {
+    if (this.lockClient) {
+      try {
+        await this.lockClient.query("SELECT 1");
+        return true;
+      } catch {
+        // The connection (and with it the lock) is gone; try to get it again.
+        this.lockClient.release(true);
+        this.lockClient = null;
+      }
+    }
+    const client = await this.pool.connect();
+    try {
+      const { rows } = await client.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_lock($1) AS locked",
+        [CONTROLLER_LOCK_ID],
+      );
+      if (!rows[0]?.locked) {
+        client.release();
+        return false;
+      }
+      // Errors on a checked-out client would otherwise crash the process.
+      client.on("error", () => {});
+      this.lockClient = client;
+      return true;
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+  }
+
+  async unlockController(): Promise<void> {
+    const client = this.lockClient;
+    this.lockClient = null;
+    if (!client) return;
+    try {
+      await client.query("SELECT pg_advisory_unlock($1)", [CONTROLLER_LOCK_ID]);
+      client.release();
+    } catch {
+      client.release(true);
+    }
   }
 
   private async inTransaction<T>(work: (client: pg.PoolClient) => Promise<T>): Promise<T> {

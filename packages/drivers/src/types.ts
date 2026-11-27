@@ -57,6 +57,23 @@ export interface Runtime {
   remove(projectId: string): Promise<void>;
   /** Remove what outlives redeploys: the project's volumes and network. */
   removeData(projectId: string): Promise<void>;
+  /** Stop the project's containers, keeping them (and their data) for a later start. */
+  stop(projectId: string): Promise<void>;
+  /**
+   * Start a stopped version again, dependencies first. If any container is
+   * missing, the version is deployed again from `spec` instead.
+   */
+  start(spec: AppSpec): Promise<void>;
+  /**
+   * The last lines a container wrote. `service` picks a compose service
+   * (default: the public one). Null if there is no such container.
+   */
+  logs(projectId: string, service: string | null, tail: number): Promise<string | null>;
+  /**
+   * Bytes the public container has received so far, or null if it is not
+   * running. A change means the app had traffic (used for auto-stop).
+   */
+  receivedBytes(projectId: string): Promise<number | null>;
   /** Delete an image built for the project. Succeeds if it is already gone. */
   removeImage(image: string): Promise<void>;
 }
