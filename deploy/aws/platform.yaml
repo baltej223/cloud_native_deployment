@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cloud platform on one EC2 instance. Docker runs the platform (Compose) and the
+  user apps; app URLs are http://<public-ip>:8001-8050. Sized for the AWS free tier.
+
+Parameters:
+  AllowedCidr:
+    Type: String
+    Description: Who may open the dashboard and API (ports 3000 and 3001), for example 203.0.113.7/32. The API has no login yet, so keep this narrow.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Free-tier eligible in most Regions (t2.micro in a few).
+  VolumeSize:
+    Type: Number
+    Default: 20
+    MinValue: 12
+    MaxValue: 30
+    Description: Root disk in GiB (the free tier covers 30).
+  RepoUrl:
+    Type: String
+    Default: https://github.com/baltej223/cloud_native_deployment.git
+  Branch:
+    Type: String
+    Default: main
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Cloud platform - dashboard, API and app ports
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3000, ToPort: 3001, CidrIp: !Ref AllowedCidr, Description: Dashboard and API }
+        - { IpProtocol: tcp, FromPort: 8001, ToPort: 8050, CidrIp: 0.0.0.0/0, Description: User apps }
+      Tags: [{ Key: Name, Value: cloud-platform }]
+
+  # No SSH: shell access goes through Systems Manager Session Manager.
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds: [!GetAtt SecurityGroup.GroupId]
+      MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: { VolumeSize: !Ref VolumeSize, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true }
+      Tags: [{ Key: Name, Value: cloud-platform }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > >(tee /var/log/cloud-platform-setup.log) 2>&1
+
+          # 2 GiB swap: builds do not fit in 1 GiB of memory.
+          if [ ! -f /swapfile ]; then
+            fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+          fi
+          swapon -a
+
+          # Docker Engine with the Compose and Buildx plugins, from Docker's apt repository.
+          apt-get update
+          apt-get install -y ca-certificates curl git
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" > /etc/apt/sources.list.d/docker.list
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          systemctl enable --now docker
+
+          git clone --branch ${Branch} ${RepoUrl} /opt/cloud-platform
+
+          # Start the platform on every boot: the public IP can change after a stop.
+          cat > /etc/systemd/system/cloud-platform.service <<'UNIT'
+          [Unit]
+          Description=Cloud platform
+          After=docker.service network-online.target
+          Requires=docker.service
+          Wants=network-online.target
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/opt/cloud-platform/deploy/aws/start.sh
+          TimeoutStartSec=3600
+
+          [Install]
+          WantedBy=multi-user.target
+          UNIT
+          systemctl daemon-reload
+          systemctl enable --now cloud-platform.service
+
+Outputs:
+  DashboardUrl:
+    Value: !Sub http://${Instance.PublicIp}:3000
+  ApiUrl:
+    Value: !Sub http://${Instance.PublicIp}:3001
+  InstanceId:
+    Value: !Ref Instance
+  SetupLog:
+    Description: Open a shell with Session Manager and read this file to follow the first boot.
+    Value: /var/log/cloud-platform-setup.log

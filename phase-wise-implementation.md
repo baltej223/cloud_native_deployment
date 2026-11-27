@@ -150,35 +150,31 @@ A controller with a documented state machine, and a dashboard that supports the 
 
 ---
 
-## Phase 4: Add AWS drivers and deploy the platform to AWS
+## Phase 4: Deploy the platform to AWS on one EC2 instance
 
 ### Goal
 
-Run the same platform on AWS, with user apps built by CodeBuild and run on ECS.
+Run the same platform on AWS within the free tier. The local Docker drivers are reused unchanged: one EC2 instance runs Docker, the platform's Compose stack and the user apps.
 
-### Resources
+### Resources (`deploy/aws/platform.yaml`)
 
-- **AWS CodeBuild:** one project that clones a repository, builds the image and pushes it to ECR. Parameters (repository, branch, Dockerfile, image tag) are passed per build. Privileged mode for Docker builds; 15-minute timeout; logs to CloudWatch.
-- **Amazon ECR:** repositories for the platform images (web, api, migrate) and one `apps` repository for user images, with a lifecycle policy that keeps the latest images only.
-- **Amazon ECS on Fargate:** the platform's web and API services, plus one service per user app, created by the controller.
-- **Application Load Balancer:** port 80 serves the platform. Each user app gets its own listener on its assigned port (8001-8050) and its own target group. An optional domain mode uses host-based rules on one listener instead.
-- **VPC and security groups:** the ALB security group allows the platform port from the allowed IP range and the app ports from anywhere; app tasks only accept traffic from the ALB.
-- **IAM:** a task role for the API scoped to platform-prefixed ECS services, task definitions, listeners, target groups and the one CodeBuild project; `iam:PassRole` only for the app execution role; a CodeBuild role that can push only to the `apps` repository; an app execution role that can only pull from ECR and write logs.
-- **SSM Parameter Store:** the database password, injected into the API at runtime.
-- **CloudWatch Logs:** separate log groups for the platform, builds and apps.
+- **EC2:** one Ubuntu 24.04 t3.micro with a 20 GiB encrypted gp3 disk, IMDSv2 required and 2 GiB swap for builds.
+- **Security group:** ports 3000-3001 (dashboard and API) from `AllowedCidr` only; app ports 8001-8050 from anywhere; no SSH.
+- **IAM:** an instance role with Session Manager access only. User apps get no AWS credentials.
+- **Boot:** user data installs Docker from Docker's apt repository and clones the repository; `cloud-platform.service` runs `deploy/aws/start.sh` on every boot, which starts Compose with the instance's current public IP.
 
-Implement `Builder` with CodeBuild, `Runtime` with ECS, and `Router` with ALB listeners and target groups. Select the drivers with configuration (`PLATFORM_DRIVER=local` or `aws`).
+The CodeBuild, ECR, ECS and load balancer design is dropped: it does not fit a free account.
 
 ### Deliverable
 
-A staging environment where a user can deploy an image or repository from the dashboard and open the app through its ALB URL.
+`aws cloudformation deploy` brings up a working platform; deploying an image and a repository from the dashboard each give a working `http://<ip>:<port>` URL.
 
 ### Completion checks
 
-- The platform is reachable through the ALB and its health checks pass.
-- Deploying an image and a repository on AWS each produce a working URL.
-- User apps have no IAM task role and cannot reach AWS APIs with platform credentials.
-- Deleting a project removes its ECS service, task definitions, listener and target group.
+- The dashboard and API are reachable only from the allowed address.
+- An image deploy and a repository deploy both work on the instance.
+- After a stop and start of the instance, the platform comes back with the new IP.
+- Deleting the stack leaves no billable resources.
 
 ---
 
