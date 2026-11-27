@@ -110,27 +110,43 @@ With `USE_SUPABASE=yes`, Compose does not start the local postgres container. Us
 ## Run it on AWS (one EC2 instance)
 
 `deploy/aws/platform.yaml` is a CloudFormation stack sized for the free tier: one
-Ubuntu instance (t3.micro, 20 GiB gp3, 2 GiB swap) running Docker and this Compose
-stack. There is no SSH; use Session Manager. Apps get `http://<public-ip>:8001-8050`.
+Ubuntu instance (t3.micro, 20 GiB gp3, 2 GiB swap) with an Elastic IP, running
+Docker, this Compose stack and Caddy. The dashboard is at `https://<your domain>`
+behind a password; apps get `http://<your domain>:8001-8050`. There is no SSH;
+use Session Manager.
 
-```bash
-aws cloudformation deploy --stack-name cloud-platform \
-  --template-file deploy/aws/platform.yaml --capabilities CAPABILITY_IAM \
-  --parameter-overrides AllowedCidr=$(curl -s https://checkip.amazonaws.com)/32
-aws cloudformation describe-stacks --stack-name cloud-platform \
-  --query "Stacks[0].Outputs" --output table   # dashboard URL
-```
+1. Store the admin password (type it yourself; it never goes in the repository):
 
-The first boot installs Docker and builds the images, which takes 10-20 minutes
-(log: `/var/log/cloud-platform-setup.log`). On every boot, `deploy/aws/start.sh`
-starts the platform with the current public IP. On the instance, apps are limited
-to 256 MB, 5 projects and 30 minutes idle time. The API has no login yet, so
-`AllowedCidr` should be your own address only.
+   ```bash
+   read -rs PW && aws ssm put-parameter --name /cloud-platform/admin-password \
+     --type SecureString --overwrite --value "$PW"; unset PW
+   ```
+
+2. Create or update the stack, then point your domain's DNS **A record** at the
+   `ElasticIp` output. Caddy gets the HTTPS certificate once DNS resolves.
+
+   ```bash
+   aws cloudformation deploy --stack-name cloud-platform \
+     --template-file deploy/aws/platform.yaml --capabilities CAPABILITY_IAM \
+     --parameter-overrides Domain=deploy.example.com
+   aws cloudformation describe-stacks --stack-name cloud-platform \
+     --query "Stacks[0].Outputs" --output table
+   ```
+
+The first boot installs Docker and builds the images (5-20 minutes; log:
+`/var/log/cloud-platform-setup.log`). On every boot `deploy/aws/start.sh` reads the
+domain and password from SSM Parameter Store and starts the platform. To change
+the password, update the parameter and run
+`sudo systemctl restart cloud-platform` on the instance. On the instance, apps are
+limited to 256 MB, 5 projects and 30 minutes idle time.
+
+Locally, login is off unless `ADMIN_PASSWORD` is set.
 
 Remove everything, including user apps (they run on the instance):
 
 ```bash
 aws cloudformation delete-stack --stack-name cloud-platform
+aws ssm delete-parameter --name /cloud-platform/admin-password
 ```
 
 ## Development

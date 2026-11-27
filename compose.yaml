@@ -69,6 +69,10 @@ services:
       DEPLOY_HEALTH_TIMEOUT_SECONDS: ${DEPLOY_HEALTH_TIMEOUT_SECONDS:-120}
       BUILD_TIMEOUT_SECONDS: ${BUILD_TIMEOUT_SECONDS:-900}
       AUTO_STOP_IDLE_MINUTES: ${AUTO_STOP_IDLE_MINUTES:-120}
+      # Login for the dashboard; empty turns it off (local development).
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      SECURE_COOKIES: ${SECURE_COOKIES:-false}
     # Local development only: the container engine socket gives the API full
     # control of the host's containers. The socket is only writable by root
     # and the docker group, so the API runs as root here; SELinux labelling is

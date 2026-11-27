@@ -162,6 +162,20 @@ The last lines the running app wrote to stdout and stderr, with timestamps.
 
 Returns `202 { "id": "…", "status": "deleting" }`. The controller stops any build, removes the app and its built images, then the project record; after that, `GET /projects/:id` returns `404` and the name and port can be reused.
 
+## Login
+
+When the API has `ADMIN_PASSWORD` set, every endpoint except `/health/*`,
+`GET /auth/session` and `POST /auth/login` needs a session cookie, and answers
+`401 UNAUTHORIZED` without one.
+
+- `POST /auth/login` `{ "password": "..." }`: sets `cp_session` (HttpOnly,
+  SameSite=Strict, Secure with `SECURE_COOKIES=true`, 12 hours). Wrong password:
+  `401`; five failures from one address in 15 minutes: `429 TOO_MANY_ATTEMPTS`.
+- `POST /auth/logout`: clears the cookie.
+- `GET /auth/session`: `{ "required": true, "signedIn": false }`.
+
+Without `ADMIN_PASSWORD` (local development) login is off and `required` is `false`.
+
 ## Deployments
 
 ### `POST /projects/:id/deployments`

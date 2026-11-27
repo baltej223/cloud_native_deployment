@@ -460,3 +460,12 @@ label.inline {
     display: none;
   }
 }
+
+.sign-out {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+}
+.login {
+  width: min(100%, 420px);
+}

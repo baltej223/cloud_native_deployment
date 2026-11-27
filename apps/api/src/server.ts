@@ -58,6 +58,11 @@ const app = createApp({
   logger,
   allowedOrigins: config.WEB_ORIGIN,
   readinessChecks,
+  auth: {
+    password: config.ADMIN_PASSWORD,
+    secret: config.SESSION_SECRET,
+    secureCookie: config.SECURE_COOKIES,
+  },
 });
 
 const controller = new DeploymentController(repository, builder, runtime, router, logger, {

@@ -58,6 +58,16 @@ export const loadConfig = () =>
     DEPLOY_TIMEOUT_SECONDS: z.coerce.number().int().min(30).default(600),
     /** Stop apps that had no network traffic for this long; 0 turns auto-stop off. */
     AUTO_STOP_IDLE_MINUTES: z.coerce.number().int().min(0).default(120),
+
+    /** Admin password for the dashboard; empty turns login off (local development). */
+    ADMIN_PASSWORD: z.string().default(""),
+    /** Signs session cookies; random per start when empty (sessions end on restart). */
+    SESSION_SECRET: z.string().default(""),
+    /** Send the session cookie only over HTTPS. */
+    SECURE_COOKIES: z
+      .enum(["true", "false"])
+      .default("false")
+      .transform((value) => value === "true"),
   });
 
 export type ApiConfig = ReturnType<typeof loadConfig>;

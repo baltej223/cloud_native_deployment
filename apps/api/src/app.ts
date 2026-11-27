@@ -3,6 +3,7 @@ import type { ListDeploymentsResponse, ListProjectsResponse } from "@cloud-platf
 import type { Logger } from "@cloud-platform/platform";
 import cors from "cors";
 import express, { type ErrorRequestHandler, type RequestHandler } from "express";
+import { type AuthOptions, createAuth } from "./auth.js";
 import { HttpError } from "./errors.js";
 import type { ProjectsService } from "./projects-service.js";
 
@@ -12,6 +13,8 @@ export interface AppDependencies {
   allowedOrigins: string[];
   /** Resolve when every required dependency is reachable; reject otherwise. */
   readinessChecks: Record<string, () => Promise<void>>;
+  /** Admin login; omitted or without a password, every request is allowed. */
+  auth?: AuthOptions;
 }
 
 const READINESS_TIMEOUT_MS = 2_000;
@@ -23,9 +26,18 @@ function withTimeout(promise: Promise<void>, ms: number): Promise<void> {
   ]);
 }
 
-export function createApp({ projects, logger, allowedOrigins, readinessChecks }: AppDependencies) {
+export function createApp({
+  projects,
+  logger,
+  allowedOrigins,
+  readinessChecks,
+  auth = { password: "", secureCookie: false },
+}: AppDependencies) {
   const app = express();
   app.disable("x-powered-by");
+  // Behind a reverse proxy on a private network: use its X-Forwarded-For.
+  app.set("trust proxy", "loopback, uniquelocal");
+  const { router: authRouter, guard } = createAuth(auth);
 
   const requestLogger: RequestHandler = (request, response, next) => {
     const requestId = request.header("x-request-id") ?? randomUUID();
@@ -48,8 +60,10 @@ export function createApp({ projects, logger, allowedOrigins, readinessChecks }:
   };
 
   app.use(requestLogger);
-  app.use(cors({ origin: allowedOrigins }));
+  app.use(cors({ origin: allowedOrigins, credentials: true }));
   app.use(express.json({ limit: "100kb" }));
+  app.use(authRouter);
+  app.use(guard);
 
   app.get("/health/live", (_request, response) => {
     response.json({ status: "ok" });

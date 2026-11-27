@@ -28,9 +28,17 @@ async function readError(response: Response, fallback: string): Promise<string> 
 async function call<T>(path: string, init: RequestInit, fallback: string): Promise<T> {
   let response: Response;
   try {
-    response = await fetch(`${apiBaseUrl}${path}`, { cache: "no-store", ...init });
+    response = await fetch(`${apiBaseUrl}${path}`, {
+      cache: "no-store",
+      credentials: "include",
+      ...init,
+    });
   } catch {
     throw new Error("Cannot reach the platform API. Is it running?");
+  }
+  if (response.status === 401 && !path.startsWith("/auth/") && typeof window !== "undefined") {
+    window.location.assign("/login");
+    throw new Error("Sign in first.");
   }
   if (!response.ok) throw new Error(await readError(response, fallback));
   return (await response.json()) as T;
@@ -99,6 +107,19 @@ export const getRuntimeLogs = (id: string, service: string | null, tail = 300) =
     {},
     "Could not load the app's logs.",
   );
+
+export interface Session {
+  required: boolean;
+  signedIn: boolean;
+}
+
+export const getSession = () => call<Session>("/auth/session", {}, "Could not check the session.");
+
+export const login = (password: string) =>
+  call<Session>("/auth/login", jsonRequest("POST", { password }), "Could not sign in.");
+
+export const logout = () =>
+  call<Session>("/auth/logout", { method: "POST" }, "Could not sign out.");
 
 export const listDeployments = async (projectId: string) =>
   (

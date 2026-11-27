@@ -1,0 +1,11 @@
+# HTTPS for the dashboard on EC2. Caddy gets the certificate from Let's Encrypt.
+# /api/* goes to the API (prefix removed); everything else to the dashboard.
+{$DOMAIN} {
+	encode gzip
+	handle_path /api/* {
+		reverse_proxy api:3001
+	}
+	handle {
+		reverse_proxy web:3000
+	}
+}
