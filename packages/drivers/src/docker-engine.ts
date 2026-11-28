@@ -274,6 +274,8 @@ export interface ContainerInspect {
     ExitCode: number;
     /** RFC 3339; "0001-01-01T00:00:00Z" when never started. */
     StartedAt?: string;
+    /** Present when the container has a healthcheck. */
+    Health?: { Status: "starting" | "healthy" | "unhealthy" };
   };
   RestartCount: number;
   Config: { Labels: Record<string, string> | null };

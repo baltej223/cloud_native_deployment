@@ -3,9 +3,11 @@ import { test } from "node:test";
 import {
   choosePublicService,
   containerPortOf,
+  durationSeconds,
   interpolate,
   parseCompose,
   parseEnvFile,
+  parseHealthcheck,
   splitCommand,
 } from "./compose.js";
 import { DeployError } from "./types.js";
@@ -188,4 +190,50 @@ test("small helpers", () => {
   assert.equal(containerPortOf(8080), 8080);
   assert.deepEqual(splitCommand(`echo 'a b' "c \\"d\\"" e\\ f`), ["echo", "a b", 'c "d"', "e f"]);
   assert.deepEqual(parseEnvFile('A=1 # note\nB="x=y"\n'), { A: "1", B: "x=y" });
+});
+
+test("healthchecks and service_healthy dependencies are kept", () => {
+  const { services } = parse(
+    `
+services:
+  db:
+    image: mysql:8.4
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -u$$USER"]
+      interval: 3s
+      retries: 40
+  cache:
+    image: redis:7
+  app:
+    image: app:1
+    depends_on:
+      db: { condition: service_healthy }
+      cache: { condition: service_started }
+`,
+  );
+  const db = services.find((service) => service.name === "db")!;
+  assert.deepEqual(db.healthcheck, {
+    test: ["CMD-SHELL", "mysqladmin ping -u$USER"],
+    intervalSeconds: 3,
+    timeoutSeconds: 30,
+    retries: 40,
+    startPeriodSeconds: 0,
+  });
+  const app = services.find((service) => service.name === "app")!;
+  assert.deepEqual(app.waitFor, ["db"]);
+  assert.deepEqual(app.dependsOn.sort(), ["cache", "db"]);
+  assert.equal(services.find((service) => service.name === "cache")!.healthcheck, null);
+});
+
+test("durations and disabled healthchecks", () => {
+  assert.equal(durationSeconds("1m30s", 0), 90);
+  assert.equal(durationSeconds("500ms", 0), 0.5);
+  assert.equal(durationSeconds(undefined, 30), 30);
+  assert.equal(durationSeconds("soon", 30), 30);
+  assert.equal(parseHealthcheck({ disable: true }, "x"), null);
+  assert.equal(parseHealthcheck({ test: ["NONE"] }, "x"), null);
+  assert.deepEqual(parseHealthcheck({ test: "curl -f localhost" }, "x")!.test, [
+    "CMD-SHELL",
+    "curl -f localhost",
+  ]);
 });

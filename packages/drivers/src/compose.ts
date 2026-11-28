@@ -1,6 +1,7 @@
 import { IMAGE_REFERENCE_PATTERN, normalizeImageReference } from "@cloud-platform/contracts";
 import { posix } from "node:path";
 import { parse } from "yaml";
+import type { HealthcheckSpec } from "@cloud-platform/contracts";
 import { DeployError, type ServiceSpec, type VolumeMount } from "./types.js";
 
 /**
@@ -27,6 +28,8 @@ export interface ServiceBuild {
 }
 
 export interface ParsedService extends Omit<ServiceSpec, "image" | "pull" | "httpPort"> {
+  healthcheck: HealthcheckSpec | null;
+  waitFor: string[];
   /** Registry image, fully qualified; null when the service is built. */
   image: string | null;
   build: ServiceBuild | null;
@@ -98,6 +101,7 @@ const HANDLED_SERVICE_KEYS = new Set([
   "ports",
   "expose",
   "depends_on",
+  "healthcheck",
   "restart",
   "volumes",
   "working_dir",
@@ -110,7 +114,6 @@ const QUIET_SERVICE_KEYS = new Set([
   "container_name",
   "networks",
   "labels",
-  "healthcheck",
   "deploy",
   "mem_limit",
   "memswap_limit",
@@ -291,6 +294,42 @@ const toCommand = (value: unknown): string[] | null => {
   if (Array.isArray(value)) return value.map(String);
   return splitCommand(String(value));
 };
+
+/** Compose durations such as "3s", "1m30s", "500ms"; a bare number is seconds. */
+export function durationSeconds(value: unknown, fallback: number): number {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value === "number") return value;
+  const text = String(value).trim();
+  if (/^\d+(\.\d+)?$/.test(text)) return Number(text);
+  const units: Record<string, number> = { h: 3600, m: 60, s: 1, ms: 0.001, us: 1e-6 };
+  let total = 0;
+  let matched = "";
+  for (const [, amount, unit] of text.matchAll(/(\d+(?:\.\d+)?)(ms|us|h|m|s)/g)) {
+    total += Number(amount) * units[unit!]!;
+    matched += `${amount}${unit}`;
+  }
+  return matched === text && total > 0 ? total : fallback;
+}
+
+export function parseHealthcheck(value: unknown, service: string): HealthcheckSpec | null {
+  if (!isMapping(value) || value.disable === true) return null;
+  const test = value.test;
+  let command: string[];
+  if (typeof test === "string") command = ["CMD-SHELL", test];
+  else if (Array.isArray(test) && test.length > 0) command = test.map(String);
+  else return null;
+  if (command[0] === "NONE") return null;
+  if (command[0] !== "CMD" && command[0] !== "CMD-SHELL") {
+    throw new DeployError(`service ${service}: healthcheck test must start with CMD or CMD-SHELL.`);
+  }
+  return {
+    test: command,
+    intervalSeconds: durationSeconds(value.interval, 30),
+    timeoutSeconds: durationSeconds(value.timeout, 30),
+    retries: Number(value.retries ?? 3) || 3,
+    startPeriodSeconds: durationSeconds(value.start_period, 0),
+  };
+}
 
 function restartPolicy(value: unknown): ServiceSpec["restart"] {
   const text = value === undefined || value === null ? "" : String(value);
@@ -549,10 +588,18 @@ function parseService(
       ? Object.keys(service.depends_on)
       : [];
 
+  const waitFor = isMapping(service.depends_on)
+    ? Object.entries(service.depends_on)
+        .filter(([, spec]) => isMapping(spec) && spec.condition === "service_healthy")
+        .map(([dependency]) => dependency)
+    : [];
+
   return {
     name,
     image,
     build,
+    healthcheck: parseHealthcheck(service.healthcheck, name),
+    waitFor,
     publishes: ports.length > 0,
     port,
     command: toCommand(service.command),

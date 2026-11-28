@@ -306,6 +306,19 @@ export interface ServiceSpec {
   dependsOn: string[];
   /** Port of a service that publishes ports (`ports:`): it gets its own URL. */
   httpPort?: number | null;
+  /** The service's `healthcheck:`, run by Docker. */
+  healthcheck?: HealthcheckSpec | null;
+  /** Services that must report healthy before this one starts (`condition: service_healthy`). */
+  waitFor?: string[];
+}
+
+export interface HealthcheckSpec {
+  /** Docker form: ["CMD", ...] or ["CMD-SHELL", "..."]. */
+  test: string[];
+  intervalSeconds: number;
+  timeoutSeconds: number;
+  retries: number;
+  startPeriodSeconds: number;
 }
 
 /** What a compose file deploys: its services and the one that gets the URL. */

@@ -17,6 +17,9 @@ import {
 export interface LocalRuntimeOptions {
   /** Docker or Podman API socket. */
   socketPath: string;
+  /** How long a compose dependency may take to become healthy. */
+  healthyTimeoutMs?: number;
+  healthPollMs?: number;
   /**
    * Network the app containers join. It is separate from the platform's own
    * network, so apps cannot reach the database or the API's internals.
@@ -38,6 +41,9 @@ const PULL_NOT_FOUND =
 const PORT_IN_USE = /address already in use|port is already allocated|bind/i;
 
 /** Runs apps as containers on the local Docker or Podman engine. */
+/** Docker durations are in nanoseconds. */
+const seconds = (value: number) => Math.round(value * 1e9);
+
 export class LocalRuntime implements Runtime {
   private readonly engine: DockerEngine;
 
@@ -132,6 +138,9 @@ export class LocalRuntime implements Runtime {
     await this.engine.ensureNetwork(network, labels);
 
     for (const service of plan.services) {
+      for (const dependency of service.waitFor ?? []) {
+        await this.waitHealthy(spec.projectId, dependency, plan);
+      }
       const isPublic = service.name === plan.publicService;
       const name = isPublic
         ? appName(spec.projectId)
@@ -151,6 +160,17 @@ export class LocalRuntime implements Runtime {
         ...(service.workingDir ? { WorkingDir: service.workingDir } : {}),
         ...(service.user ? { User: service.user } : {}),
         ...(isPublic ? { ExposedPorts: { [port]: {} } } : {}),
+        ...(service.healthcheck
+          ? {
+              Healthcheck: {
+                Test: service.healthcheck.test,
+                Interval: seconds(service.healthcheck.intervalSeconds),
+                Timeout: seconds(service.healthcheck.timeoutSeconds),
+                Retries: service.healthcheck.retries,
+                StartPeriod: seconds(service.healthcheck.startPeriodSeconds),
+              },
+            }
+          : {}),
         Volumes: Object.fromEntries(service.tmpVolumes.map((path) => [path, {}])),
         Labels: {
           ...labels,
@@ -181,6 +201,31 @@ export class LocalRuntime implements Runtime {
       }
       await this.engine.startContainer(name);
     }
+  }
+
+  /**
+   * Wait until a compose service's healthcheck passes (depends_on with
+   * condition: service_healthy). Fails if it exits or stays unhealthy.
+   */
+  private async waitHealthy(projectId: string, service: string, plan: ComposePlan) {
+    const dependency = plan.services.find((candidate) => candidate.name === service);
+    if (!dependency?.healthcheck) return;
+    const name =
+      service === plan.publicService
+        ? appName(projectId)
+        : serviceContainerName(projectId, service);
+    const deadline = Date.now() + (this.options.healthyTimeoutMs ?? 300_000);
+    while (Date.now() < deadline) {
+      const state = (await this.engine.inspectContainer(name))?.State;
+      if (state?.Health?.Status === "healthy") return;
+      if (state && (state.Status === "exited" || state.Status === "dead")) {
+        throw new DeployError(
+          `Service ${service} exited with code ${state.ExitCode} before it was healthy. See the app logs.`,
+        );
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.options.healthPollMs ?? 2_000));
+    }
+    throw new DeployError(`Service ${service} did not become healthy in time.`);
   }
 
   async inspect(projectId: string): Promise<AppState> {
@@ -236,7 +281,14 @@ export class LocalRuntime implements Runtime {
     );
     if (!sameVersion) return this.deploy({ ...spec, pull: false });
     try {
-      for (const name of names) await this.engine.startContainer(name);
+      const plan = spec.compose;
+      for (const [index, name] of names.entries()) {
+        const service = plan?.services[index];
+        for (const dependency of service?.waitFor ?? []) {
+          await this.waitHealthy(spec.projectId, dependency, plan!);
+        }
+        await this.engine.startContainer(name);
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (PORT_IN_USE.test(message)) {
